@@ -313,13 +313,32 @@ fn run_directshow_capture_inner(
     let mut scaler: Option<ScaleContext> = None;
     let mut scaled_frame = Video::empty();
 
+    // Try to initialize GPU-accelerated MJPEG decode (NVIDIA nvJPEG)
+    #[cfg(feature = "gpu-decode")]
+    let is_mjpeg = requested_pixel_format
+        .map(|f| f.eq_ignore_ascii_case("mjpeg"))
+        .unwrap_or(false);
+    #[cfg(feature = "gpu-decode")]
+    let mut gpu_decoder = if is_mjpeg {
+        crate::gpu_decode::NvjpegDecoder::try_new()
+    } else {
+        None
+    };
+    #[cfg(feature = "gpu-decode")]
+    let use_gpu = gpu_decoder.is_some();
+    #[cfg(feature = "gpu-decode")]
+    let mut gpu_errors = 0_u32;
+    #[cfg(not(feature = "gpu-decode"))]
+    let use_gpu = false;
+
     info!(
-        "capture thread opened DirectShow stream for '{}' at {}x{} @ {}fps using {}",
+        "capture thread opened DirectShow stream for '{}' at {}x{} @ {}fps using {} (gpu_decode={})",
         device_name,
         requested_width,
         requested_height,
         requested_fps,
-        requested_pixel_format.unwrap_or("auto")
+        requested_pixel_format.unwrap_or("auto"),
+        use_gpu,
     );
 
     for (stream, packet) in input.packets() {
@@ -331,6 +350,67 @@ fn run_directshow_capture_inner(
             continue;
         }
 
+        // Try GPU decode first when available (MJPEG only)
+        #[cfg(feature = "gpu-decode")]
+        if let Some(ref mut gpu) = gpu_decoder {
+            if let Some(data) = packet.data() {
+                match gpu.decode(data) {
+                    Ok(frame) => {
+                        let width = frame.width;
+                        let height = frame.height;
+                        total_frames += 1;
+                        gpu_errors = 0; // reset consecutive error count on success
+
+                        if !logged_first_frame {
+                            logged_first_frame = true;
+                            info!(
+                                "first GPU-decoded frame from '{}' => {}x{} {:?}",
+                                device_name, width, height, frame.format
+                            );
+                        }
+                        if total_frames.is_multiple_of(120) {
+                            info!(
+                                "GPU-decoded {} frames from '{}' (latest {}x{})",
+                                total_frames, device_name, width, height
+                            );
+                        }
+
+                        if frame_tx.send(frame).is_err() {
+                            return Ok(());
+                        }
+
+                        stats_frame_counter += 1;
+                        let elapsed = last_stats_at.elapsed();
+                        if elapsed >= Duration::from_millis(300) {
+                            let fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
+                            let _ = stats_tx.send(CaptureStats { fps, width, height });
+                            last_stats_at = Instant::now();
+                            stats_frame_counter = 0;
+                        }
+                        continue; // skip software decode
+                    }
+                    Err(crate::gpu_decode::GpuDecodeError::InvalidData(_)) => {
+                        // Bad packet (e.g. config header) — skip to software decode
+                        // for this packet, keep GPU decode active for the next one
+                    }
+                    Err(e) => {
+                        // CUDA or nvJPEG error — count consecutive failures
+                        gpu_errors += 1;
+                        if gpu_errors >= 3 {
+                            warn!(
+                                "nvJPEG failed {gpu_errors} times consecutively, \
+                                 disabling GPU decode: {e}"
+                            );
+                            gpu_decoder = None;
+                        } else {
+                            warn!("nvJPEG decode error ({gpu_errors}/3): {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Software decode path (fallback or non-MJPEG formats)
         if let Err(error) = decoder.send_packet(&packet) {
             packet_errors += 1;
             if packet_errors <= 10 || packet_errors.is_multiple_of(50) {

@@ -1,6 +1,8 @@
 mod audio;
 mod capture;
 mod devices;
+#[cfg(feature = "gpu-decode")]
+mod gpu_decode;
 mod logger;
 mod render;
 mod settings;

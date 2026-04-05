@@ -3027,6 +3027,7 @@ dependencies = [
  "ffmpeg-next",
  "image",
  "instant",
+ "libloading",
  "pollster",
  "serde",
  "serde_json",

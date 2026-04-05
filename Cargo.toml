@@ -29,6 +29,11 @@ windows = { version = "0.58", features = [
   "Win32_System_Threading",
   "Win32_UI_Shell",
 ] }
+libloading = { version = "0.8", optional = true }
+
+[features]
+default = ["gpu-decode"]
+gpu-decode = ["dep:libloading"]
 
 [profile.release]
 opt-level = 3
