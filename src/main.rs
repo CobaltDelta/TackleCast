@@ -2,6 +2,8 @@ mod audio;
 mod capture;
 mod devices;
 #[cfg(feature = "gpu-decode")]
+mod dx12_interop;
+#[cfg(feature = "gpu-decode")]
 mod gpu_decode;
 mod logger;
 mod render;
@@ -448,6 +450,14 @@ impl App {
             return;
         }
 
+        // Try to initialize shared DX12 buffers for zero-copy GPU decode
+        #[cfg(feature = "gpu-decode")]
+        let shared_gpu_handles = if let Some(renderer) = &mut self.renderer {
+            renderer.try_init_shared_buffers(capture_config.width, capture_config.height)
+        } else {
+            None
+        };
+
         info!(
             "starting DirectShow capture: device='{}' {}x{} @ {}fps ({}, threads={})",
             video_device,
@@ -465,6 +475,8 @@ impl App {
                 device_name: video_device,
                 pixel_format: capture_config.pixel_format.to_string(),
                 decode_threads: capture_config.decode_threads,
+                #[cfg(feature = "gpu-decode")]
+                shared_gpu_handles,
             },
         }));
     }

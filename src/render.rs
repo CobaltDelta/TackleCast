@@ -29,12 +29,28 @@ pub struct Renderer {
     uniforms: wgpu::Buffer,
     video_frame: Option<VideoFrameResources>,
     egui_renderer: EguiRenderer,
+    // Reusable scratch buffers to avoid per-frame allocations
+    pad_scratch: Vec<u8>,
+    nv12_u_scratch: Vec<u8>,
+    nv12_v_scratch: Vec<u8>,
+    // Shared DX12 buffers for zero-copy GPU decode (None = not available)
+    #[cfg(feature = "gpu-decode")]
+    shared_gpu_buffers: Option<crate::dx12_interop::SharedGpuBuffers>,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Result<Self, RenderError> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::default();
+        // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
+        // Fall back to all backends if DX12 isn't available.
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: if cfg!(windows) {
+                wgpu::Backends::DX12
+            } else {
+                wgpu::Backends::all()
+            },
+            ..Default::default()
+        });
         let surface = instance
             .create_surface(window)
             .map_err(RenderError::CreateSurface)?;
@@ -185,6 +201,11 @@ impl Renderer {
             uniforms,
             video_frame: None,
             egui_renderer,
+            pad_scratch: Vec::new(),
+            nv12_u_scratch: Vec::new(),
+            nv12_v_scratch: Vec::new(),
+            #[cfg(feature = "gpu-decode")]
+            shared_gpu_buffers: None,
         })
     }
 
@@ -205,13 +226,40 @@ impl Renderer {
     }
 
     pub fn upload_frame(&mut self, frame: &CaptureFrame) {
+        match frame {
+            CaptureFrame::Cpu {
+                width,
+                height,
+                format,
+                y_data,
+                u_data,
+                v_data,
+            } => self.upload_cpu_frame(*width, *height, *format, y_data, u_data, v_data),
+            #[cfg(feature = "gpu-decode")]
+            CaptureFrame::Gpu {
+                width,
+                height,
+                buffer_index,
+            } => self.upload_gpu_frame(*width, *height, *buffer_index),
+        }
+    }
+
+    fn upload_cpu_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        y_data: &[u8],
+        u_data: &[u8],
+        v_data: &[u8],
+    ) {
         let needs_rebuild = self
             .video_frame
             .as_ref()
             .map(|video_frame| {
-                video_frame.width != frame.width
-                    || video_frame.height != frame.height
-                    || video_frame.format != frame.format
+                video_frame.width != width
+                    || video_frame.height != height
+                    || video_frame.format != format
             })
             .unwrap_or(true);
 
@@ -221,9 +269,9 @@ impl Renderer {
                 &self.video_bind_group_layout,
                 &self.video_sampler,
                 &self.uniforms,
-                frame.width,
-                frame.height,
-                frame.format,
+                width,
+                height,
+                format,
             ));
         }
 
@@ -234,52 +282,205 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniforms,
             0,
-            bytemuck::bytes_of(&VideoUniforms::for_format(frame.format)),
+            bytemuck::bytes_of(&VideoUniforms::for_format(format)),
         );
 
         upload_plane_r8(
             &self.queue,
             &video_frame.y_texture,
-            frame.width,
-            frame.height,
-            &frame.y_data,
+            width,
+            height,
+            y_data,
+            &mut self.pad_scratch,
         );
 
-        match frame.format {
+        match format {
             PixelFormat::Nv12 => {
-                let (u_plane, v_plane) = deinterleave_nv12(frame.width, frame.height, &frame.u_data);
+                let (u_plane, v_plane) = deinterleave_nv12_into(
+                    width,
+                    height,
+                    u_data,
+                    &mut self.nv12_u_scratch,
+                    &mut self.nv12_v_scratch,
+                );
                 upload_plane_r8(
                     &self.queue,
                     &video_frame.u_texture,
-                    frame.width / 2,
-                    frame.height / 2,
-                    &u_plane,
+                    width / 2,
+                    height / 2,
+                    u_plane,
+                    &mut self.pad_scratch,
                 );
                 upload_plane_r8(
                     &self.queue,
                     &video_frame.v_texture,
-                    frame.width / 2,
-                    frame.height / 2,
-                    &v_plane,
+                    width / 2,
+                    height / 2,
+                    v_plane,
+                    &mut self.pad_scratch,
                 );
             }
             PixelFormat::Yuvj422p => {
                 upload_plane_r8(
                     &self.queue,
                     &video_frame.u_texture,
-                    frame.width / 2,
-                    frame.height,
-                    &frame.u_data,
+                    width / 2,
+                    height,
+                    u_data,
+                    &mut self.pad_scratch,
                 );
                 upload_plane_r8(
                     &self.queue,
                     &video_frame.v_texture,
-                    frame.width / 2,
-                    frame.height,
-                    &frame.v_data,
+                    width / 2,
+                    height,
+                    v_data,
+                    &mut self.pad_scratch,
                 );
             }
         }
+    }
+
+    /// Try to initialize shared DX12 ↔ CUDA buffers for zero-copy.
+    /// Returns shared handles for the CUDA side if successful.
+    #[cfg(feature = "gpu-decode")]
+    pub fn try_init_shared_buffers(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<crate::dx12_interop::SharedPlaneHandles>> {
+        let shared =
+            crate::dx12_interop::SharedGpuBuffers::try_new(&self.device, width, height)?;
+        let handles: Vec<_> = shared.handles.to_vec();
+        self.shared_gpu_buffers = Some(shared);
+        Some(handles)
+    }
+
+    #[cfg(feature = "gpu-decode")]
+    fn upload_gpu_frame(&mut self, width: u32, height: u32, buffer_index: usize) {
+        let Some(shared) = &self.shared_gpu_buffers else {
+            tracing::warn!("GPU frame received but no shared buffers initialized");
+            return;
+        };
+
+        if buffer_index >= shared.buffer_sets.len() {
+            tracing::warn!("GPU frame buffer_index {buffer_index} out of range");
+            return;
+        }
+
+        let format = PixelFormat::Yuvj422p; // nvJPEG always outputs YUV 4:2:2
+
+        // Rebuild textures if dimensions changed
+        let needs_rebuild = self
+            .video_frame
+            .as_ref()
+            .map(|vf| vf.width != width || vf.height != height || vf.format != format)
+            .unwrap_or(true);
+
+        if needs_rebuild {
+            self.video_frame = Some(VideoFrameResources::new(
+                &self.device,
+                &self.video_bind_group_layout,
+                &self.video_sampler,
+                &self.uniforms,
+                width,
+                height,
+                format,
+            ));
+        }
+
+        let Some(video_frame) = &self.video_frame else {
+            return;
+        };
+
+        self.queue.write_buffer(
+            &self.uniforms,
+            0,
+            bytemuck::bytes_of(&VideoUniforms::for_format(format)),
+        );
+
+        let buf_set = &shared.buffer_sets[buffer_index];
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+        // GPU-side copy: shared buffer → Y texture
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tacklecast-gpu-copy-encoder"),
+            });
+
+        let y_bytes_per_row = align_up(width, alignment);
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf_set.y_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(y_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &video_frame.y_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // GPU-side copy: shared buffer → U texture (half-width, full-height for 4:2:2)
+        let chroma_width = width / 2;
+        let uv_bytes_per_row = align_up(chroma_width, alignment);
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf_set.u_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(uv_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &video_frame.u_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: chroma_width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // GPU-side copy: shared buffer → V texture
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf_set.v_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(uv_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &video_frame.v_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: chroma_width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     pub fn render(&mut self, ui: Option<PreparedUi>) -> Result<(), RenderError> {
@@ -510,6 +711,11 @@ impl VideoFrameResources {
     }
 }
 
+/// Align a byte count up to the next multiple of `alignment`.
+fn align_up(value: u32, alignment: u32) -> u32 {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
 fn texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -551,8 +757,10 @@ fn upload_plane_r8(
     width: u32,
     height: u32,
     data: &[u8],
+    scratch: &mut Vec<u8>,
 ) {
-    let (padded_data, bytes_per_row) = pad_rows(data, width as usize, height as usize);
+    let (padded_data, bytes_per_row) =
+        pad_rows_into(data, width as usize, height as usize, scratch);
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -560,7 +768,7 @@ fn upload_plane_r8(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &padded_data,
+        padded_data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(bytes_per_row),
@@ -574,41 +782,61 @@ fn upload_plane_r8(
     );
 }
 
-fn pad_rows(data: &[u8], row_bytes: usize, rows: usize) -> (Vec<u8>, u32) {
+/// Pad rows to wgpu alignment using a reusable scratch buffer.
+/// Returns the data slice to upload and the padded bytes-per-row.
+/// When no padding is needed, returns the input data directly.
+fn pad_rows_into<'a>(
+    data: &'a [u8],
+    row_bytes: usize,
+    rows: usize,
+    scratch: &'a mut Vec<u8>,
+) -> (&'a [u8], u32) {
     let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
     let padded_row_bytes = row_bytes.next_multiple_of(alignment);
 
     if row_bytes == padded_row_bytes {
-        return (data.to_vec(), row_bytes as u32);
+        return (data, row_bytes as u32);
     }
 
-    let mut padded = vec![0_u8; padded_row_bytes * rows];
+    let needed = padded_row_bytes * rows;
+    scratch.resize(needed, 0);
     for row in 0..rows {
         let src_start = row * row_bytes;
         let dst_start = row * padded_row_bytes;
-        padded[dst_start..dst_start + row_bytes]
+        scratch[dst_start..dst_start + row_bytes]
             .copy_from_slice(&data[src_start..src_start + row_bytes]);
+        // Zero padding bytes (only needed on first use or if dimensions grew)
+        for b in &mut scratch[dst_start + row_bytes..dst_start + padded_row_bytes] {
+            *b = 0;
+        }
     }
 
-    (padded, padded_row_bytes as u32)
+    (scratch, padded_row_bytes as u32)
 }
 
-fn deinterleave_nv12(width: u32, height: u32, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+fn deinterleave_nv12_into<'a>(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    u_scratch: &'a mut Vec<u8>,
+    v_scratch: &'a mut Vec<u8>,
+) -> (&'a [u8], &'a [u8]) {
     let chroma_width = (width / 2) as usize;
     let chroma_height = (height / 2) as usize;
-    let mut u_plane = vec![0_u8; chroma_width * chroma_height];
-    let mut v_plane = vec![0_u8; chroma_width * chroma_height];
+    let needed = chroma_width * chroma_height;
+    u_scratch.resize(needed, 0);
+    v_scratch.resize(needed, 0);
 
     for y in 0..chroma_height {
         for x in 0..chroma_width {
             let src_index = (y * chroma_width + x) * 2;
             let dst_index = y * chroma_width + x;
-            u_plane[dst_index] = data[src_index];
-            v_plane[dst_index] = data[src_index + 1];
+            u_scratch[dst_index] = data[src_index];
+            v_scratch[dst_index] = data[src_index + 1];
         }
     }
 
-    (u_plane, v_plane)
+    (&u_scratch[..needed], &v_scratch[..needed])
 }
 
 #[cfg(test)]
@@ -617,9 +845,12 @@ mod tests {
 
     #[test]
     fn nv12_deinterleave_splits_uv_pairs() {
-        let (u_plane, v_plane) = deinterleave_nv12(4, 2, &[10, 20, 30, 40]);
-        assert_eq!(u_plane, vec![10, 30]);
-        assert_eq!(v_plane, vec![20, 40]);
+        let mut u_scratch = Vec::new();
+        let mut v_scratch = Vec::new();
+        let (u_plane, v_plane) =
+            deinterleave_nv12_into(4, 2, &[10, 20, 30, 40], &mut u_scratch, &mut v_scratch);
+        assert_eq!(u_plane, &[10, 30]);
+        assert_eq!(v_plane, &[20, 40]);
     }
 
     #[test]

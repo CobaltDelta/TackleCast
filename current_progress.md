@@ -12,8 +12,9 @@ A lightweight, GPU-accelerated capture card viewer for Windows, written in Rust.
 src/
   main.rs          — winit event loop, app state, settings application
   capture.rs       — DirectShow capture via ffmpeg-next, format/resolution fallback
-  gpu_decode.rs    — NVIDIA nvJPEG GPU MJPEG decode (feature-gated: gpu-decode)
-  render.rs        — wgpu renderer, YUV->RGB WGSL shader, aspect-ratio letterboxing
+  gpu_decode.rs    — NVIDIA nvJPEG GPU MJPEG decode, zero-copy + owned modes (feature-gated: gpu-decode)
+  dx12_interop.rs  — DX12 shared buffer creation for CUDA↔wgpu zero-copy (feature-gated: gpu-decode)
+  render.rs        — wgpu DX12 renderer, YUV->RGB WGSL shader, GPU-side buffer→texture copy
   audio.rs         — WASAPI audio passthrough via cpal (input->output with volume)
   ui.rs            — egui overlay pill + settings pause menu
   devices.rs       — DirectShow video + WASAPI audio device enumeration
@@ -48,6 +49,29 @@ assets/
 - Searches CUDA Toolkit install paths if DLLs not on system PATH
 - **DHT injection**: Automatically injects standard JPEG Huffman tables into UVC MJPEG streams that omit them (per UVC spec). Zero-copy fast path when DHT already present. Ensures compatibility with Elgato, AVerMedia, cheap USB dongles, and other capture cards beyond ShadowCast.
 
+### Phase 2A.5 + 2B: Zero-Copy GPU Pipeline (Complete)
+Eliminates all CPU-side data movement for the GPU decode path. Three-tier fallback chain:
+
+1. **Zero-copy** (CUDA → shared DX12 buffer → wgpu `copy_buffer_to_texture`):
+   - nvJPEG decodes directly into DX12 committed buffers with `D3D12_HEAP_FLAG_SHARED`
+   - CUDA imports shared handles via `cuImportExternalMemory` + `cuExternalMemoryGetMappedBuffer`
+   - wgpu wraps them via HAL `buffer_from_raw()` and does GPU-side `copy_buffer_to_texture`
+   - Frame data **never touches CPU** after decode — zero PCIe bandwidth for decoded frames
+   - Double-buffered (2 sets of Y/U/V buffers) for concurrent decode + render
+   - wgpu forced to DX12 backend on Windows (required for CUDA interop)
+
+2. **GPU decode + host readback** (fallback when DX12 interop unavailable):
+   - Double-buffered host planes with `std::mem::replace` ownership transfer
+   - Eliminates the `.to_vec()` copies that were adding ~864 MB/s at 1440p@120fps
+
+3. **Software decode** (fallback when CUDA/nvJPEG unavailable):
+   - `queue.write_texture()` with pre-allocated scratch buffers in Renderer
+   - No per-frame `Vec` allocations in `pad_rows()` or `deinterleave_nv12()`
+
+- `CaptureFrame` is now an enum: `Cpu { ... }` (with pixel data) or `Gpu { buffer_index }` (zero-copy reference)
+- Automatic fallback: zero-copy → host readback → software decode, transparent to user
+- Tested at 1440p@120fps on RTX 5080 (desktop) and RTX 3050 (laptop) — see Known Issues for details
+
 ### Settings Menu (30/60/120/Custom FPS)
 - Frame rate dropdown: 30 FPS, 60 FPS, 120 FPS, Custom (30-240)
 - Resolution dropdown: 720p, 1080p, 1440p, 4K
@@ -64,6 +88,14 @@ Webcams (e.g. Logitech C920) appear in the device list and may partially work, b
 - The resolution/FPS fallback will find a working mode, but H.264 streams may show visual corruption.
 - MJPEG modes on webcams typically max out at 30fps at 1080p. The app will auto-negotiate to a supported mode.
 - This is a bonus compatibility feature, not a primary use case. TackleCast is designed for capture cards.
+
+### Laptop Performance at 120fps (RTX 3050 + i5-13420H)
+Tested with ShadowCast 3 at 1440p@120fps with zero-copy pipeline:
+- **With zero-copy (Phase 2B)**: ~118-120fps sustained over 3.5+ minutes (25,320 frames). Massive improvement from the ~80-100fps before zero-copy.
+- **Remaining bottleneck**: Occasional DirectShow buffer overflow during transient GPU load spikes (Windows compositor, background tasks). This is nvJPEG decode latency on the 3050, **not** a bandwidth issue — the PCIe round-trip has been completely eliminated.
+- **Before zero-copy**: ~80-100fps with constant buffer overflow. Root cause was GPU→CPU→GPU data round trip: `cuMemcpyDtoH` + `.to_vec()` + `queue.write_texture()` = ~2.6 GB/s through PCIe 4.0 x4.
+- **60fps NV12 works perfectly** on this hardware — zero decode overhead and ~330 MB/s data rate.
+- **RTX 3050 laptop has PCIe 4.0 x4** (half the bandwidth of desktop x16), which was the bottleneck before zero-copy.
 
 ### Friend's Testing (ShadowCast 2 Pro + RTX 4080 + i7-12700)
 - GPU decode requires NVIDIA driver 570+ for CUDA 13 compatibility
@@ -92,18 +124,10 @@ cargo run -- --test      # test pattern mode (no capture card needed)
 - Release exe + FFmpeg DLLs + nvJPEG DLLs (for GPU decode)
 - Packaging script: `scripts/package_rust_release.ps1`
 - GPU decode bundle: `dist/TackleCast-GPU-Decode/`
+- Zero-copy bundle: `dist/TackleCast-ZeroCopy/`
 - See `BUILD.md` for full packaging details
 
 ## Next Steps
-
-### Phase 2B: Zero-Copy GPU Pipeline (Future)
-Eliminate the GPU->CPU->GPU round trip that currently happens after nvJPEG decode:
-- nvJPEG decode outputs to CUDA device memory
-- Export CUDA memory as DX12 shared handle
-- Import into wgpu via HAL interop
-- Frame data never touches CPU after decode
-
-This requires unsafe wgpu HAL code and DX12 interop. Not urgent — Phase 2A performance is already excellent at 1440p@120fps on RTX 5080.
 
 ### Multi-Vendor GPU Decode Support
 Currently GPU decode is NVIDIA-only (nvJPEG/CUDA). Future work to support:

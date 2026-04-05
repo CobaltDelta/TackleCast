@@ -25,13 +25,51 @@ pub enum PixelFormat {
 }
 
 #[derive(Debug, Clone)]
-pub struct CaptureFrame {
-    pub width: u32,
-    pub height: u32,
-    pub format: PixelFormat,
-    pub y_data: Vec<u8>,
-    pub u_data: Vec<u8>,
-    pub v_data: Vec<u8>,
+pub enum CaptureFrame {
+    /// Frame data lives in CPU memory (software decode or GPU decode fallback).
+    Cpu {
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        y_data: Vec<u8>,
+        u_data: Vec<u8>,
+        v_data: Vec<u8>,
+    },
+    /// Frame data lives in a shared DX12/CUDA GPU buffer (zero-copy path).
+    /// The renderer knows where the actual buffers are; this just carries
+    /// the dimensions and which double-buffer set to read from.
+    #[cfg(feature = "gpu-decode")]
+    Gpu {
+        width: u32,
+        height: u32,
+        buffer_index: usize,
+    },
+}
+
+impl CaptureFrame {
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Cpu { width, .. } => *width,
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { width, .. } => *width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Cpu { height, .. } => *height,
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { height, .. } => *height,
+        }
+    }
+
+    pub fn format(&self) -> Option<PixelFormat> {
+        match self {
+            Self::Cpu { format, .. } => Some(*format),
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { .. } => Some(PixelFormat::Yuvj422p), // nvJPEG always outputs YUV 4:2:2
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +106,11 @@ pub enum CaptureSource {
         device_name: String,
         pixel_format: String,
         decode_threads: usize,
+        /// Shared DX12 buffer handles for zero-copy GPU decode.
+        /// When present, the capture thread will try to use these for
+        /// nvJPEG decode directly into GPU memory.
+        #[cfg(feature = "gpu-decode")]
+        shared_gpu_handles: Option<Vec<crate::dx12_interop::SharedPlaneHandles>>,
     },
 }
 
@@ -107,6 +150,8 @@ impl CaptureThread {
                 device_name,
                 pixel_format,
                 decode_threads,
+                #[cfg(feature = "gpu-decode")]
+                shared_gpu_handles,
             } => run_directshow_capture(
                 device_name,
                 config.width,
@@ -119,6 +164,8 @@ impl CaptureThread {
                 stats_tx,
                 error_tx,
                 negotiated_tx,
+                #[cfg(feature = "gpu-decode")]
+                shared_gpu_handles,
             ),
         });
 
@@ -224,6 +271,8 @@ fn run_directshow_capture(
     stats_tx: Sender<CaptureStats>,
     error_tx: Sender<String>,
     negotiated_tx: Sender<NegotiatedConfig>,
+    #[cfg(feature = "gpu-decode")]
+    shared_gpu_handles: Option<Vec<crate::dx12_interop::SharedPlaneHandles>>,
 ) {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -265,6 +314,8 @@ fn run_directshow_capture(
                 stop_flag.clone(),
                 frame_tx.clone(),
                 stats_tx.clone(),
+                #[cfg(feature = "gpu-decode")]
+                &shared_gpu_handles,
             ) {
                 Ok(()) => {
                     // Notify if we fell back to different settings
@@ -308,6 +359,8 @@ fn run_directshow_capture_inner(
     stop_flag: Arc<AtomicBool>,
     frame_tx: Sender<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
+    #[cfg(feature = "gpu-decode")]
+    shared_gpu_handles: &Option<Vec<crate::dx12_interop::SharedPlaneHandles>>,
 ) -> Result<(), String> {
     let dshow_format = find_dshow_format()
         .ok_or_else(|| "DirectShow input format was not found in FFmpeg".to_string())?;
@@ -365,25 +418,40 @@ fn run_directshow_capture_inner(
         .unwrap_or(false);
     #[cfg(feature = "gpu-decode")]
     let mut gpu_decoder = if is_mjpeg {
-        crate::gpu_decode::NvjpegDecoder::try_new()
+        // Try zero-copy shared buffer mode first, then fall back to owned mode
+        if let Some(handles) = shared_gpu_handles {
+            info!("attempting zero-copy GPU decode with shared DX12 buffers");
+            crate::gpu_decode::NvjpegDecoder::try_new_shared(handles)
+                .or_else(|| {
+                    info!("zero-copy init failed, falling back to owned GPU decode");
+                    crate::gpu_decode::NvjpegDecoder::try_new()
+                })
+        } else {
+            crate::gpu_decode::NvjpegDecoder::try_new()
+        }
     } else {
         None
     };
     #[cfg(feature = "gpu-decode")]
     let use_gpu = gpu_decoder.is_some();
     #[cfg(feature = "gpu-decode")]
+    let is_zero_copy = gpu_decoder.as_ref().map(|d| d.is_zero_copy()).unwrap_or(false);
+    #[cfg(feature = "gpu-decode")]
     let mut gpu_errors = 0_u32;
     #[cfg(not(feature = "gpu-decode"))]
     let use_gpu = false;
+    #[cfg(not(feature = "gpu-decode"))]
+    let is_zero_copy = false;
 
     info!(
-        "capture thread opened DirectShow stream for '{}' at {}x{} @ {}fps using {} (gpu_decode={})",
+        "capture thread opened DirectShow stream for '{}' at {}x{} @ {}fps using {} (gpu_decode={}, zero_copy={})",
         device_name,
         requested_width,
         requested_height,
         requested_fps,
         requested_pixel_format.unwrap_or("auto"),
         use_gpu,
+        is_zero_copy,
     );
 
     for (stream, packet) in input.packets() {
@@ -401,8 +469,8 @@ fn run_directshow_capture_inner(
             if let Some(data) = packet.data() {
                 match gpu.decode(data) {
                     Ok(frame) => {
-                        let width = frame.width;
-                        let height = frame.height;
+                        let width = frame.width();
+                        let height = frame.height();
                         total_frames += 1;
                         gpu_errors = 0; // reset consecutive error count on success
 
@@ -410,7 +478,7 @@ fn run_directshow_capture_inner(
                             logged_first_frame = true;
                             info!(
                                 "first GPU-decoded frame from '{}' => {}x{} {:?}",
-                                device_name, width, height, frame.format
+                                device_name, width, height, frame.format()
                             );
                         }
                         if total_frames.is_multiple_of(120) {
@@ -475,15 +543,15 @@ fn run_directshow_capture_inner(
                 requested_fps > 60,
             )
                 .map_err(|error| format!("failed to convert decoded frame: {error}"))?;
-            let width = frame.width;
-            let height = frame.height;
+            let width = frame.width();
+            let height = frame.height();
             total_frames += 1;
 
             if !logged_first_frame {
                 logged_first_frame = true;
                 info!(
                     "first decoded frame from '{}' => {}x{} {:?}",
-                    device_name, width, height, frame.format
+                    device_name, width, height, frame.format()
                 );
             }
             if total_frames.is_multiple_of(120) {
@@ -595,7 +663,7 @@ fn extract_supported_frame_with_format(
         PixelFormat::Yuvj422p => copy_plane(frame, 2, (width / 2) as usize, height as usize),
     };
 
-    Ok(CaptureFrame {
+    Ok(CaptureFrame::Cpu {
         width,
         height,
         format,
@@ -726,7 +794,7 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
                 }
             }
 
-            CaptureFrame {
+            CaptureFrame::Cpu {
                 width,
                 height,
                 format,
@@ -753,7 +821,7 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
                 }
             }
 
-            CaptureFrame {
+            CaptureFrame::Cpu {
                 width,
                 height,
                 format,
@@ -772,17 +840,23 @@ mod tests {
     #[test]
     fn generates_expected_plane_sizes_for_nv12() {
         let frame = generate_test_frame(1280, 720, 0, PixelFormat::Nv12);
-        assert_eq!(frame.y_data.len(), 1280 * 720);
-        assert_eq!(frame.u_data.len(), 1280 * 720 / 2);
-        assert!(frame.v_data.is_empty());
+        let CaptureFrame::Cpu { y_data, u_data, v_data, .. } = &frame else {
+            panic!("expected Cpu frame");
+        };
+        assert_eq!(y_data.len(), 1280 * 720);
+        assert_eq!(u_data.len(), 1280 * 720 / 2);
+        assert!(v_data.is_empty());
     }
 
     #[test]
     fn generates_expected_plane_sizes_for_yuvj422p() {
         let frame = generate_test_frame(1280, 720, 0, PixelFormat::Yuvj422p);
-        assert_eq!(frame.y_data.len(), 1280 * 720);
-        assert_eq!(frame.u_data.len(), 640 * 720);
-        assert_eq!(frame.v_data.len(), 640 * 720);
+        let CaptureFrame::Cpu { y_data, u_data, v_data, .. } = &frame else {
+            panic!("expected Cpu frame");
+        };
+        assert_eq!(y_data.len(), 1280 * 720);
+        assert_eq!(u_data.len(), 640 * 720);
+        assert_eq!(v_data.len(), 640 * 720);
     }
 
     #[test]

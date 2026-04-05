@@ -9,7 +9,7 @@ use crate::capture::{CaptureFrame, PixelFormat};
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::ptr;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 // ---------------------------------------------------------------------------
 // DHT (Huffman table) injection for UVC MJPEG streams
@@ -165,8 +165,33 @@ type CUdevice = i32;
 type CUcontext = *mut c_void;
 type CUstream = *mut c_void;
 type CUdeviceptr = u64;
+type CUexternalMemory = *mut c_void;
 
 const CUDA_SUCCESS: CUresult = 0;
+
+// External memory handle types for CUDA ↔ DX12 interop
+const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE: i32 = 0x02;
+const CUDA_EXTERNAL_MEMORY_DEDICATED: u32 = 0x01;
+
+/// Descriptor for importing external memory (DX12 shared handle → CUDA).
+#[repr(C)]
+struct CudaExternalMemoryHandleDesc {
+    typ: i32,
+    handle_win32_handle: *mut c_void, // NT handle
+    handle_win32_name: *mut c_void,   // must be null when handle is set
+    size: u64,
+    flags: u32,
+    reserved: [u32; 16],
+}
+
+/// Descriptor for mapping a buffer region within imported external memory.
+#[repr(C)]
+struct CudaExternalMemoryBufferDesc {
+    offset: u64,
+    size: u64,
+    flags: u32,
+    reserved: [u32; 16],
+}
 
 // ---------------------------------------------------------------------------
 // nvJPEG API — FFI types and constants
@@ -220,6 +245,13 @@ struct CudaLib {
     cu_mem_alloc: unsafe extern "system" fn(*mut CUdeviceptr, usize) -> CUresult,
     cu_mem_free: unsafe extern "system" fn(CUdeviceptr) -> CUresult,
     cu_memcpy_dtoh: unsafe extern "system" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
+    // External memory APIs for DX12 ↔ CUDA zero-copy interop (optional — may not exist on older drivers)
+    cu_import_external_memory:
+        Option<unsafe extern "system" fn(*mut CUexternalMemory, *const CudaExternalMemoryHandleDesc) -> CUresult>,
+    cu_external_memory_get_mapped_buffer:
+        Option<unsafe extern "system" fn(*mut CUdeviceptr, CUexternalMemory, *const CudaExternalMemoryBufferDesc) -> CUresult>,
+    cu_destroy_external_memory:
+        Option<unsafe extern "system" fn(CUexternalMemory) -> CUresult>,
 }
 
 impl CudaLib {
@@ -237,6 +269,30 @@ impl CudaLib {
             let cu_mem_alloc = *lib.get(b"cuMemAlloc_v2\0").ok()?;
             let cu_mem_free = *lib.get(b"cuMemFree_v2\0").ok()?;
             let cu_memcpy_dtoh = *lib.get(b"cuMemcpyDtoH_v2\0").ok()?;
+
+            // Optional external memory APIs (require CUDA 10+ / recent drivers)
+            let cu_import_external_memory = lib
+                .get(b"cuImportExternalMemory\0")
+                .ok()
+                .map(|sym| *sym);
+            let cu_external_memory_get_mapped_buffer = lib
+                .get(b"cuExternalMemoryGetMappedBuffer\0")
+                .ok()
+                .map(|sym| *sym);
+            let cu_destroy_external_memory = lib
+                .get(b"cuDestroyExternalMemory\0")
+                .ok()
+                .map(|sym| *sym);
+
+            let has_ext_mem = cu_import_external_memory.is_some()
+                && cu_external_memory_get_mapped_buffer.is_some()
+                && cu_destroy_external_memory.is_some();
+            if has_ext_mem {
+                debug!("CUDA external memory APIs available (zero-copy eligible)");
+            } else {
+                debug!("CUDA external memory APIs not found (zero-copy not available)");
+            }
+
             Some(Self {
                 _lib: lib,
                 cu_init,
@@ -249,8 +305,18 @@ impl CudaLib {
                 cu_mem_alloc,
                 cu_mem_free,
                 cu_memcpy_dtoh,
+                cu_import_external_memory,
+                cu_external_memory_get_mapped_buffer,
+                cu_destroy_external_memory,
             })
         }
+    }
+
+    /// Returns true if CUDA external memory APIs are available for zero-copy.
+    fn has_external_memory_support(&self) -> bool {
+        self.cu_import_external_memory.is_some()
+            && self.cu_external_memory_get_mapped_buffer.is_some()
+            && self.cu_destroy_external_memory.is_some()
     }
 }
 
@@ -382,6 +448,44 @@ struct DeviceBuffer {
 // NvjpegDecoder — the public API
 // ---------------------------------------------------------------------------
 
+/// Imported DX12 shared buffer mapped into CUDA address space.
+struct ImportedSharedBuffer {
+    ext_mem: CUexternalMemory,
+    device_ptr: CUdeviceptr,
+}
+
+/// One double-buffer set of imported shared plane buffers.
+struct SharedPlaneSet {
+    y: ImportedSharedBuffer,
+    u: ImportedSharedBuffer,
+    v: ImportedSharedBuffer,
+}
+
+/// Decode mode determines where decoded frames end up.
+enum DecodeMode {
+    /// CUDA-owned device buffers + double-buffered host readback (fallback).
+    /// Two sets of host buffers: decode into one, move the other into CaptureFrame.
+    Owned {
+        d_y: DeviceBuffer,
+        d_u: DeviceBuffer,
+        d_v: DeviceBuffer,
+        host_bufs: [HostPlaneSet; 2],
+        host_index: usize,
+    },
+    /// DX12 shared buffers imported into CUDA (zero-copy path).
+    Shared {
+        sets: Vec<SharedPlaneSet>,
+        current_index: usize,
+    },
+}
+
+/// One set of host-side plane buffers for readback.
+struct HostPlaneSet {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
 pub struct NvjpegDecoder {
     cuda: CudaLib,
     nvjpeg: NvjpegLib,
@@ -389,19 +493,19 @@ pub struct NvjpegDecoder {
     stream: CUstream,
     handle: NvjpegHandle,
     state: NvjpegJpegState,
-    // Pre-allocated device buffers for Y, U, V planes
-    d_y: DeviceBuffer,
-    d_u: DeviceBuffer,
-    d_v: DeviceBuffer,
-    // Pre-allocated host buffers for readback
-    h_y: Vec<u8>,
-    h_u: Vec<u8>,
-    h_v: Vec<u8>,
+    mode: DecodeMode,
     // Current allocation dimensions
     alloc_width: u32,
     alloc_height: u32,
     // Whether first frame has been validated
     validated: bool,
+}
+
+/// Returns true if this decoder is using zero-copy shared buffers.
+impl NvjpegDecoder {
+    pub fn is_zero_copy(&self) -> bool {
+        matches!(self.mode, DecodeMode::Shared { .. })
+    }
 }
 
 impl NvjpegDecoder {
@@ -513,7 +617,7 @@ impl NvjpegDecoder {
             };
 
             info!(
-                "nvJPEG GPU decoder initialized (pre-allocated for {}x{} YUV 4:2:2)",
+                "nvJPEG GPU decoder initialized in owned mode (pre-allocated for {}x{} YUV 4:2:2)",
                 w, h
             );
 
@@ -524,12 +628,24 @@ impl NvjpegDecoder {
                 stream,
                 handle,
                 state,
-                d_y,
-                d_u,
-                d_v,
-                h_y: vec![0u8; y_size],
-                h_u: vec![0u8; uv_size],
-                h_v: vec![0u8; uv_size],
+                mode: DecodeMode::Owned {
+                    d_y,
+                    d_u,
+                    d_v,
+                    host_bufs: [
+                        HostPlaneSet {
+                            y: vec![0u8; y_size],
+                            u: vec![0u8; uv_size],
+                            v: vec![0u8; uv_size],
+                        },
+                        HostPlaneSet {
+                            y: vec![0u8; y_size],
+                            u: vec![0u8; uv_size],
+                            v: vec![0u8; uv_size],
+                        },
+                    ],
+                    host_index: 0,
+                },
                 alloc_width: w,
                 alloc_height: h,
                 validated: false,
@@ -537,7 +653,198 @@ impl NvjpegDecoder {
         }
     }
 
+    /// Initialize with DX12 shared buffers for zero-copy decode.
+    /// `shared_handles` contains NT handles + sizes for each double-buffer set.
+    pub fn try_new_shared(
+        shared_handles: &[crate::dx12_interop::SharedPlaneHandles],
+    ) -> Option<Self> {
+        let cuda = CudaLib::try_load().or_else(|| {
+            debug!("nvcuda.dll not found — GPU decode unavailable");
+            None
+        })?;
+
+        if !cuda.has_external_memory_support() {
+            debug!("CUDA external memory APIs not available — falling back to owned mode");
+            return None;
+        }
+
+        let nvjpeg = NvjpegLib::try_load().or_else(|| {
+            debug!("nvjpeg DLL not found — GPU decode unavailable");
+            None
+        })?;
+
+        unsafe {
+            let res = (cuda.cu_init)(0);
+            if res != CUDA_SUCCESS {
+                debug!("cuInit failed (error {res})");
+                return None;
+            }
+
+            let mut device: CUdevice = 0;
+            let res = (cuda.cu_device_get)(&mut device, 0);
+            if res != CUDA_SUCCESS {
+                debug!("cuDeviceGet failed (error {res})");
+                return None;
+            }
+
+            let mut ctx: CUcontext = ptr::null_mut();
+            let res = (cuda.cu_ctx_create)(&mut ctx, 0, device);
+            if res != CUDA_SUCCESS {
+                debug!("cuCtxCreate failed (error {res})");
+                return None;
+            }
+
+            let mut stream: CUstream = ptr::null_mut();
+            let res = (cuda.cu_stream_create)(&mut stream, 0);
+            if res != CUDA_SUCCESS {
+                (cuda.cu_ctx_destroy)(ctx);
+                return None;
+            }
+
+            let mut nvjpeg_handle: NvjpegHandle = ptr::null_mut();
+            let res = (nvjpeg.create_simple)(&mut nvjpeg_handle);
+            if res != NVJPEG_STATUS_SUCCESS {
+                (cuda.cu_stream_destroy)(stream);
+                (cuda.cu_ctx_destroy)(ctx);
+                return None;
+            }
+
+            let mut nvjpeg_state: NvjpegJpegState = ptr::null_mut();
+            let res = (nvjpeg.state_create)(nvjpeg_handle, &mut nvjpeg_state);
+            if res != NVJPEG_STATUS_SUCCESS {
+                (nvjpeg.destroy)(nvjpeg_handle);
+                (cuda.cu_stream_destroy)(stream);
+                (cuda.cu_ctx_destroy)(ctx);
+                return None;
+            }
+
+            // Import each shared buffer set from DX12 handles
+            let cu_import = cuda.cu_import_external_memory.unwrap();
+            let cu_map = cuda.cu_external_memory_get_mapped_buffer.unwrap();
+
+            let import_buffer =
+                |handle: *mut c_void, size: u64| -> Option<ImportedSharedBuffer> {
+                    let desc = CudaExternalMemoryHandleDesc {
+                        typ: CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE,
+                        handle_win32_handle: handle,
+                        handle_win32_name: ptr::null_mut(),
+                        size,
+                        flags: CUDA_EXTERNAL_MEMORY_DEDICATED,
+                        reserved: [0; 16],
+                    };
+
+                    let mut ext_mem: CUexternalMemory = ptr::null_mut();
+                    let res = cu_import(&mut ext_mem, &desc);
+                    if res != CUDA_SUCCESS {
+                        warn!("cuImportExternalMemory failed (error {res})");
+                        return None;
+                    }
+
+                    let buf_desc = CudaExternalMemoryBufferDesc {
+                        offset: 0,
+                        size,
+                        flags: 0,
+                        reserved: [0; 16],
+                    };
+
+                    let mut device_ptr: CUdeviceptr = 0;
+                    let res = cu_map(&mut device_ptr, ext_mem, &buf_desc);
+                    if res != CUDA_SUCCESS {
+                        warn!("cuExternalMemoryGetMappedBuffer failed (error {res})");
+                        let cu_destroy = cuda.cu_destroy_external_memory.unwrap();
+                        cu_destroy(ext_mem);
+                        return None;
+                    }
+
+                    Some(ImportedSharedBuffer {
+                        ext_mem,
+                        device_ptr,
+                    })
+                };
+
+            let mut sets = Vec::with_capacity(shared_handles.len());
+            for (i, handles) in shared_handles.iter().enumerate() {
+                let y = match import_buffer(handles.y_handle, handles.y_size) {
+                    Some(b) => b,
+                    None => {
+                        warn!("failed to import Y shared buffer for set {i}");
+                        // Cleanup already-imported sets
+                        cleanup_shared_sets(&cuda, &mut sets);
+                        (nvjpeg.state_destroy)(nvjpeg_state);
+                        (nvjpeg.destroy)(nvjpeg_handle);
+                        (cuda.cu_stream_destroy)(stream);
+                        (cuda.cu_ctx_destroy)(ctx);
+                        return None;
+                    }
+                };
+                let u = match import_buffer(handles.u_handle, handles.u_size) {
+                    Some(b) => b,
+                    None => {
+                        warn!("failed to import U shared buffer for set {i}");
+                        let cu_destroy = cuda.cu_destroy_external_memory.unwrap();
+                        cu_destroy(y.ext_mem);
+                        cleanup_shared_sets(&cuda, &mut sets);
+                        (nvjpeg.state_destroy)(nvjpeg_state);
+                        (nvjpeg.destroy)(nvjpeg_handle);
+                        (cuda.cu_stream_destroy)(stream);
+                        (cuda.cu_ctx_destroy)(ctx);
+                        return None;
+                    }
+                };
+                let v = match import_buffer(handles.v_handle, handles.v_size) {
+                    Some(b) => b,
+                    None => {
+                        warn!("failed to import V shared buffer for set {i}");
+                        let cu_destroy = cuda.cu_destroy_external_memory.unwrap();
+                        cu_destroy(u.ext_mem);
+                        cu_destroy(y.ext_mem);
+                        cleanup_shared_sets(&cuda, &mut sets);
+                        (nvjpeg.state_destroy)(nvjpeg_state);
+                        (nvjpeg.destroy)(nvjpeg_handle);
+                        (cuda.cu_stream_destroy)(stream);
+                        (cuda.cu_ctx_destroy)(ctx);
+                        return None;
+                    }
+                };
+
+                debug!("imported DX12 shared buffer set {i} into CUDA");
+                sets.push(SharedPlaneSet { y, u, v });
+            }
+
+            // Use first set's sizes for alloc dimensions
+            let first = &shared_handles[0];
+            let alloc_width = 2560_u32; // will be validated on first frame
+            let alloc_height = 1440_u32;
+
+            info!(
+                "nvJPEG GPU decoder initialized in zero-copy mode ({} buffer sets, Y={}B UV={}B)",
+                sets.len(),
+                first.y_size,
+                first.u_size,
+            );
+
+            Some(Self {
+                cuda,
+                nvjpeg,
+                ctx,
+                stream,
+                handle: nvjpeg_handle,
+                state: nvjpeg_state,
+                mode: DecodeMode::Shared {
+                    sets,
+                    current_index: 0,
+                },
+                alloc_width,
+                alloc_height,
+                validated: false,
+            })
+        }
+    }
+
     /// Decode a raw JPEG frame on the GPU and return a CaptureFrame.
+    ///
+    /// In zero-copy mode, returns `CaptureFrame::Gpu` with a buffer index.
+    /// In owned mode, returns `CaptureFrame::Cpu` with pixel data.
     pub fn decode(&mut self, jpeg_data: &[u8]) -> Result<CaptureFrame, GpuDecodeError> {
         if jpeg_data.len() < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8 {
             return Err(GpuDecodeError::InvalidData(
@@ -546,10 +853,9 @@ impl NvjpegDecoder {
         }
 
         // Inject standard Huffman tables if the UVC device omitted them.
-        // Returns a zero-copy borrow when DHT is already present.
         let jpeg_data = ensure_dht(jpeg_data);
 
-        // Query image info on first frame or if not yet validated
+        // Query image info on first frame
         let (width, height) = if !self.validated {
             let info = self.get_image_info(&jpeg_data)?;
             info!(
@@ -559,19 +865,26 @@ impl NvjpegDecoder {
             self.validated = true;
             (info.0, info.1)
         } else {
-            // Trust dimensions are stable after first frame
             (self.alloc_width, self.alloc_height)
         };
 
-        // Reallocate if dimensions changed
+        // Reallocate if dimensions changed (owned mode only)
         self.ensure_buffers(width, height)?;
 
-        // Set up output image descriptor
+        // Get the device pointers for the current decode target
+        let (d_y_ptr, d_u_ptr, d_v_ptr) = match &self.mode {
+            DecodeMode::Owned { d_y, d_u, d_v, .. } => (d_y.ptr, d_u.ptr, d_v.ptr),
+            DecodeMode::Shared { sets, current_index } => {
+                let set = &sets[*current_index];
+                (set.y.device_ptr, set.u.device_ptr, set.v.device_ptr)
+            }
+        };
+
         let mut output = NvjpegImage {
             channel: [
-                self.d_y.ptr as *mut u8,
-                self.d_u.ptr as *mut u8,
-                self.d_v.ptr as *mut u8,
+                d_y_ptr as *mut u8,
+                d_u_ptr as *mut u8,
+                d_v_ptr as *mut u8,
                 ptr::null_mut(),
             ],
             pitch: [
@@ -604,47 +917,85 @@ impl NvjpegDecoder {
             }
         }
 
-        // Copy decoded planes from device to host
-        let y_size = (width * height) as usize;
-        let uv_size = ((width / 2) * height) as usize;
-
-        unsafe {
-            let res = (self.cuda.cu_memcpy_dtoh)(
-                self.h_y.as_mut_ptr() as *mut c_void,
-                self.d_y.ptr,
-                y_size,
-            );
-            if res != CUDA_SUCCESS {
-                return Err(GpuDecodeError::Cuda("cuMemcpyDtoH (Y)", res));
+        match &mut self.mode {
+            DecodeMode::Shared { current_index, sets } => {
+                // Zero-copy: data is already in the shared DX12 buffer.
+                // Return a GPU frame reference and advance the double-buffer index.
+                let buffer_index = *current_index;
+                *current_index = (*current_index + 1) % sets.len();
+                Ok(CaptureFrame::Gpu {
+                    width,
+                    height,
+                    buffer_index,
+                })
             }
+            DecodeMode::Owned {
+                d_y,
+                d_u,
+                d_v,
+                host_bufs,
+                host_index,
+            } => {
+                // Fallback: copy decoded planes from device to host.
+                // Use double-buffered host buffers to avoid .to_vec() copies:
+                // decode into set N, then swap ownership of set N into CaptureFrame
+                // while the *other* set stays for the next decode.
+                let y_size = (width * height) as usize;
+                let uv_size = ((width / 2) * height) as usize;
 
-            let res = (self.cuda.cu_memcpy_dtoh)(
-                self.h_u.as_mut_ptr() as *mut c_void,
-                self.d_u.ptr,
-                uv_size,
-            );
-            if res != CUDA_SUCCESS {
-                return Err(GpuDecodeError::Cuda("cuMemcpyDtoH (U)", res));
-            }
+                let idx = *host_index;
+                let buf = &mut host_bufs[idx];
 
-            let res = (self.cuda.cu_memcpy_dtoh)(
-                self.h_v.as_mut_ptr() as *mut c_void,
-                self.d_v.ptr,
-                uv_size,
-            );
-            if res != CUDA_SUCCESS {
-                return Err(GpuDecodeError::Cuda("cuMemcpyDtoH (V)", res));
+                unsafe {
+                    let res = (self.cuda.cu_memcpy_dtoh)(
+                        buf.y.as_mut_ptr() as *mut c_void,
+                        d_y.ptr,
+                        y_size,
+                    );
+                    if res != CUDA_SUCCESS {
+                        return Err(GpuDecodeError::Cuda("cuMemcpyDtoH (Y)", res));
+                    }
+
+                    let res = (self.cuda.cu_memcpy_dtoh)(
+                        buf.u.as_mut_ptr() as *mut c_void,
+                        d_u.ptr,
+                        uv_size,
+                    );
+                    if res != CUDA_SUCCESS {
+                        return Err(GpuDecodeError::Cuda("cuMemcpyDtoH (U)", res));
+                    }
+
+                    let res = (self.cuda.cu_memcpy_dtoh)(
+                        buf.v.as_mut_ptr() as *mut c_void,
+                        d_v.ptr,
+                        uv_size,
+                    );
+                    if res != CUDA_SUCCESS {
+                        return Err(GpuDecodeError::Cuda("cuMemcpyDtoH (V)", res));
+                    }
+                }
+
+                // Swap ownership: move the filled buffer into CaptureFrame,
+                // replace with a fresh buffer of the same capacity (zero-alloc
+                // when capacity is already sufficient, which it always is after
+                // the first frame).
+                let y_data = std::mem::replace(&mut buf.y, vec![0u8; y_size]);
+                let u_data = std::mem::replace(&mut buf.u, vec![0u8; uv_size]);
+                let v_data = std::mem::replace(&mut buf.v, vec![0u8; uv_size]);
+
+                // Advance to the other host buffer set for next decode
+                *host_index = (idx + 1) % host_bufs.len();
+
+                Ok(CaptureFrame::Cpu {
+                    width,
+                    height,
+                    format: PixelFormat::Yuvj422p,
+                    y_data,
+                    u_data,
+                    v_data,
+                })
             }
         }
-
-        Ok(CaptureFrame {
-            width,
-            height,
-            format: PixelFormat::Yuvj422p,
-            y_data: self.h_y[..y_size].to_vec(),
-            u_data: self.h_u[..uv_size].to_vec(),
-            v_data: self.h_v[..uv_size].to_vec(),
-        })
     }
 
     /// Query JPEG dimensions and subsampling from compressed data.
@@ -686,61 +1037,103 @@ impl NvjpegDecoder {
         Ok((widths[0] as u32, heights[0] as u32, css, n_components))
     }
 
-    /// Reallocate device and host buffers if dimensions changed.
+    /// Reallocate device and host buffers if dimensions changed (owned mode only).
+    /// In shared mode, buffers are pre-allocated by the DX12 interop layer.
     fn ensure_buffers(&mut self, width: u32, height: u32) -> Result<(), GpuDecodeError> {
         if width == self.alloc_width && height == self.alloc_height {
             return Ok(());
         }
 
-        info!(
-            "nvJPEG reallocating buffers: {}x{} -> {}x{}",
-            self.alloc_width, self.alloc_height, width, height
-        );
-
-        let y_size = (width * height) as usize;
-        let uv_size = ((width / 2) * height) as usize;
-
-        // Free old device buffers
-        unsafe {
-            (self.cuda.cu_mem_free)(self.d_y.ptr);
-            (self.cuda.cu_mem_free)(self.d_u.ptr);
-            (self.cuda.cu_mem_free)(self.d_v.ptr);
-        }
-
-        // Allocate new device buffers
-        let alloc = |size: usize, name: &'static str| -> Result<DeviceBuffer, GpuDecodeError> {
-            let mut ptr: CUdeviceptr = 0;
-            let res = unsafe { (self.cuda.cu_mem_alloc)(&mut ptr, size) };
-            if res != CUDA_SUCCESS {
-                Err(GpuDecodeError::Cuda(name, res))
-            } else {
-                Ok(DeviceBuffer { ptr })
+        match &mut self.mode {
+            DecodeMode::Shared { .. } => {
+                // Shared buffers are pre-allocated at a fixed size.
+                // If the actual frame dimensions differ, update tracking but
+                // don't reallocate — the buffers are large enough for up to 2560x1440.
+                self.alloc_width = width;
+                self.alloc_height = height;
+                Ok(())
             }
-        };
+            DecodeMode::Owned {
+                d_y,
+                d_u,
+                d_v,
+                host_bufs,
+                ..
+            } => {
+                info!(
+                    "nvJPEG reallocating owned buffers: {}x{} -> {}x{}",
+                    self.alloc_width, self.alloc_height, width, height
+                );
 
-        self.d_y = alloc(y_size, "cuMemAlloc (Y)")?;
-        self.d_u = alloc(uv_size, "cuMemAlloc (U)")?;
-        self.d_v = alloc(uv_size, "cuMemAlloc (V)")?;
+                let y_size = (width * height) as usize;
+                let uv_size = ((width / 2) * height) as usize;
 
-        // Resize host buffers
-        self.h_y.resize(y_size, 0);
-        self.h_u.resize(uv_size, 0);
-        self.h_v.resize(uv_size, 0);
+                // Free old device buffers
+                unsafe {
+                    (self.cuda.cu_mem_free)(d_y.ptr);
+                    (self.cuda.cu_mem_free)(d_u.ptr);
+                    (self.cuda.cu_mem_free)(d_v.ptr);
+                }
 
-        self.alloc_width = width;
-        self.alloc_height = height;
+                // Allocate new device buffers
+                let alloc =
+                    |cuda: &CudaLib, size: usize, name: &'static str| -> Result<DeviceBuffer, GpuDecodeError> {
+                        let mut ptr: CUdeviceptr = 0;
+                        let res = unsafe { (cuda.cu_mem_alloc)(&mut ptr, size) };
+                        if res != CUDA_SUCCESS {
+                            Err(GpuDecodeError::Cuda(name, res))
+                        } else {
+                            Ok(DeviceBuffer { ptr })
+                        }
+                    };
 
-        Ok(())
+                *d_y = alloc(&self.cuda, y_size, "cuMemAlloc (Y)")?;
+                *d_u = alloc(&self.cuda, uv_size, "cuMemAlloc (U)")?;
+                *d_v = alloc(&self.cuda, uv_size, "cuMemAlloc (V)")?;
+
+                // Resize both host buffer sets
+                for buf in host_bufs.iter_mut() {
+                    buf.y.resize(y_size, 0);
+                    buf.u.resize(uv_size, 0);
+                    buf.v.resize(uv_size, 0);
+                }
+
+                self.alloc_width = width;
+                self.alloc_height = height;
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Clean up imported shared buffer sets on error during initialization.
+unsafe fn cleanup_shared_sets(cuda: &CudaLib, sets: &mut Vec<SharedPlaneSet>) {
+    if let Some(cu_destroy) = cuda.cu_destroy_external_memory {
+        for set in sets.drain(..) {
+            cu_destroy(set.y.ext_mem);
+            cu_destroy(set.u.ext_mem);
+            cu_destroy(set.v.ext_mem);
+        }
     }
 }
 
 impl Drop for NvjpegDecoder {
     fn drop(&mut self) {
         unsafe {
-            // Free device memory
-            (self.cuda.cu_mem_free)(self.d_y.ptr);
-            (self.cuda.cu_mem_free)(self.d_u.ptr);
-            (self.cuda.cu_mem_free)(self.d_v.ptr);
+            // Free mode-specific resources
+            match &mut self.mode {
+                DecodeMode::Owned {
+                    d_y, d_u, d_v, ..
+                } => {
+                    (self.cuda.cu_mem_free)(d_y.ptr);
+                    (self.cuda.cu_mem_free)(d_u.ptr);
+                    (self.cuda.cu_mem_free)(d_v.ptr);
+                }
+                DecodeMode::Shared { sets, .. } => {
+                    cleanup_shared_sets(&self.cuda, sets);
+                }
+            }
 
             // Destroy nvJPEG resources
             (self.nvjpeg.state_destroy)(self.state);
