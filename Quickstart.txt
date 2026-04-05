@@ -42,4 +42,9 @@ have feature requests, please report them as issues on GitHub:
 
   https://github.com/SaltedByte/TackleCast/issues
 
+When reporting a bug, please include your log file. Logs are
+saved in the logs\ folder next to TackleCast.exe. Attach the
+most recent log file to your issue — it helps us diagnose
+problems much faster.
+
 Happy gaming!
