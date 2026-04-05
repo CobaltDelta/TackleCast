@@ -1,11 +1,15 @@
-use std::process::Command;
-
 use cpal::traits::{DeviceTrait, HostTrait};
+use tracing::warn;
+use windows::core::{GUID, HSTRING, VARIANT};
+use windows::Win32::Media::DirectShow::ICreateDevEnum;
+use windows::Win32::Media::MediaFoundation::{
+    CLSID_SystemDeviceEnum, CLSID_VideoInputDeviceCategory,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[allow(dead_code)]
 const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and"];
 
@@ -16,20 +20,69 @@ pub struct AudioDevice {
 }
 
 pub fn enumerate_video_devices() -> Vec<String> {
-    let ffmpeg = ffmpeg_path();
-    let output = Command::new(ffmpeg)
-        .args(["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    match enumerate_video_devices_dshow() {
+        Ok(devices) => devices,
+        Err(error) => {
+            warn!("DirectShow video device enumeration failed: {error}");
+            Vec::new()
+        }
+    }
+}
 
-    let Ok(output) = output else {
-        return Vec::new();
-    };
+fn enumerate_video_devices_dshow() -> Result<Vec<String>, String> {
+    unsafe {
+        // COM may already be initialized on this thread; ignore errors from re-init.
+        // Use STA to be compatible with winit's OleInitialize.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter_map(parse_video_device_line)
-        .collect()
+        let dev_enum: ICreateDevEnum =
+            CoCreateInstance(&CLSID_SystemDeviceEnum, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("CoCreateInstance for SystemDeviceEnum failed: {e}"))?;
+
+        let mut enumerator = None;
+        dev_enum
+            .CreateClassEnumerator(
+                &CLSID_VideoInputDeviceCategory as *const GUID,
+                &mut enumerator,
+                0,
+            )
+            .map_err(|e| format!("CreateClassEnumerator failed: {e}"))?;
+
+        let Some(enumerator) = enumerator else {
+            // No video capture devices on this system
+            return Ok(Vec::new());
+        };
+
+        let mut devices = Vec::new();
+        loop {
+            let mut moniker = [None];
+            let hr = enumerator.Next(&mut moniker, None);
+            if hr.is_err() {
+                break;
+            }
+            let Some(moniker) = moniker[0].take() else {
+                break;
+            };
+
+            let bag: Result<IPropertyBag, _> =
+                moniker.BindToStorage(None, None);
+            let Ok(bag) = bag else {
+                continue;
+            };
+
+            let mut var = VARIANT::default();
+            let name_prop = HSTRING::from("FriendlyName");
+            if bag.Read(&name_prop, &mut var, None).is_ok() {
+                let name = format!("{}", var);
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    devices.push(name);
+                }
+            }
+        }
+
+        Ok(devices)
+    }
 }
 
 pub fn enumerate_audio_inputs() -> Vec<AudioDevice> {
@@ -104,31 +157,6 @@ fn preferred_audio_host() -> cpal::Host {
     cpal::default_host()
 }
 
-fn ffmpeg_path() -> String {
-    std::env::var("FFMPEG")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("FFMPEG_DIR").ok().map(|dir| {
-                format!(
-                    "{}\\bin\\ffmpeg.exe",
-                    dir.trim_end_matches(['\\', '/'])
-                )
-            })
-        })
-        .unwrap_or_else(|| "ffmpeg".to_string())
-}
-
-fn parse_video_device_line(line: &str) -> Option<String> {
-    let marker = "(video)";
-    let marker_index = line.find(marker)?;
-    let prefix = &line[..marker_index];
-    let start = prefix.rfind('"')?;
-    let before_start = &prefix[..start];
-    let open = before_start.rfind('"')?;
-    Some(prefix[open + 1..start].to_string())
-}
-
 #[allow(dead_code)]
 fn keywords_for_device_name(device_name: &str) -> Vec<String> {
     device_name
@@ -149,12 +177,6 @@ enum Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_ffmpeg_device_line() {
-        let line = r#"[dshow @ 000001]  "ShadowCast 3" (video)"#;
-        assert_eq!(parse_video_device_line(line).as_deref(), Some("ShadowCast 3"));
-    }
 
     #[test]
     fn auto_detect_matches_keyword_overlap() {
