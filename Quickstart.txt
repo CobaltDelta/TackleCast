@@ -14,7 +14,7 @@ WINDOWS SMARTSCREEN
 -------------------
 Windows SmartScreen may block TackleCast from launching because
 the app is not code-signed. This is normal for open-source apps
-built with Python/PyInstaller.
+distributed without a certificate.
 
 If SmartScreen blocks the app, try clicking "More info" then
 "Run anyway." If that option is not available, you may need to

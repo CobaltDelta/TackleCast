@@ -1,12 +1,5 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Virtual environment
-.venv/
+# Rust
+/target
 
 # User settings
 tacklecast_settings.json
@@ -22,16 +15,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# mpv binary (downloaded by setup.bat)
-mpv_bin/
-
-# PyInstaller
-build/
+# Distribution builds
 dist/
-*.spec
-
-# Launcher exe (built locally)
-TackleCast.exe
 
 # Logs (generated at runtime)
 logs/
@@ -39,7 +24,5 @@ logs/
 # Claude
 .claude/
 
-
-# Added by cargo
-
-/target
+# Launcher exe (built locally)
+TackleCast.exe
