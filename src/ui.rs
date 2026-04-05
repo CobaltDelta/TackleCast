@@ -487,40 +487,21 @@ fn labeled_volume(ui: &mut egui::Ui, draft: &mut Settings) {
 }
 
 fn styled_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.scope(|ui| {
-        ui.visuals_mut().override_text_color = None;
-        let visuals = &mut ui.visuals_mut().widgets;
-        visuals.inactive.bg_fill = COLOR_PANEL_BG;
-        visuals.inactive.bg_stroke = Stroke::new(1.0, COLOR_BORDER);
-        visuals.inactive.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
-        visuals.hovered.bg_fill = Color32::from_rgb(0x1D, 0x2A, 0x4A);
-        visuals.hovered.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
-        visuals.hovered.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
-        visuals.active.bg_fill = Color32::from_rgb(0x1D, 0x2A, 0x4A);
-        visuals.active.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
-        visuals.active.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
-        ui.add(Button::new(text))
-    })
-    .inner
+    ui.add(
+        Button::new(RichText::new(text).color(COLOR_TEXT_PRIMARY))
+            .fill(COLOR_PANEL_BG)
+            .stroke(Stroke::new(1.0, COLOR_BORDER)),
+    )
 }
 
 fn exit_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.scope(|ui| {
-        ui.visuals_mut().override_text_color = None;
-        let visuals = &mut ui.visuals_mut().widgets;
-        visuals.inactive.bg_fill = COLOR_EXIT_BG;
-        visuals.inactive.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
-        visuals.inactive.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
-        visuals.hovered.bg_fill = COLOR_ACCENT;
-        visuals.hovered.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
-        visuals.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-        visuals.active.bg_fill = Color32::from_rgb(0xC7, 0x2F, 0x49);
-        visuals.active.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
-        visuals.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-        ui.with_layout(Layout::top_down(Align::Center), |ui| {
-            ui.add(Button::new("Exit TackleCast").min_size(egui::vec2(ui.available_width(), 0.0)))
-        })
-        .inner
+    ui.with_layout(Layout::top_down(Align::Center), |ui| {
+        ui.add(
+            Button::new(RichText::new("Exit TackleCast").color(COLOR_TEXT_PRIMARY))
+                .fill(COLOR_EXIT_BG)
+                .stroke(Stroke::new(1.0, COLOR_ACCENT))
+                .min_size(egui::vec2(ui.available_width(), 0.0)),
+        )
     })
     .inner
 }

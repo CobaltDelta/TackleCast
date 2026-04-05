@@ -14,6 +14,9 @@ use ffmpeg::{
     util::frame::video::Video,
 };
 use tracing::{info, warn};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -204,6 +207,11 @@ fn run_directshow_capture(
     stats_tx: Sender<CaptureStats>,
     error_tx: Sender<String>,
 ) {
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    ffmpeg::log::set_level(ffmpeg::log::Level::Error);
+
     let attempt_formats = pixel_format_attempts(&requested_pixel_format);
     let mut last_error: Option<String> = None;
     for format_attempt in attempt_formats {
@@ -261,7 +269,7 @@ fn run_directshow_capture_inner(
     let mut options = Dictionary::new();
     options.set("video_size", &format!("{requested_width}x{requested_height}"));
     options.set("framerate", &requested_fps.to_string());
-    options.set("rtbufsize", "1M");
+    options.set("rtbufsize", "16M");
     options.set("probesize", "5000000");
     options.set("analyzeduration", "1000000");
     if let Some(format_name) = requested_pixel_format {
