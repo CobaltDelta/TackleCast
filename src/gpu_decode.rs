@@ -459,6 +459,10 @@ struct SharedPlaneSet {
     y: ImportedSharedBuffer,
     u: ImportedSharedBuffer,
     v: ImportedSharedBuffer,
+    /// Row pitch for Y plane (aligned to wgpu's COPY_BYTES_PER_ROW_ALIGNMENT).
+    y_pitch: u32,
+    /// Row pitch for U/V planes (aligned).
+    uv_pitch: u32,
 }
 
 /// Decode mode determines where decoded frames end up.
@@ -808,7 +812,13 @@ impl NvjpegDecoder {
                 };
 
                 debug!("imported DX12 shared buffer set {i} into CUDA");
-                sets.push(SharedPlaneSet { y, u, v });
+                sets.push(SharedPlaneSet {
+                    y,
+                    u,
+                    v,
+                    y_pitch: handles.y_pitch,
+                    uv_pitch: handles.uv_pitch,
+                });
             }
 
             // Use first set's sizes for alloc dimensions
@@ -871,12 +881,22 @@ impl NvjpegDecoder {
         // Reallocate if dimensions changed (owned mode only)
         self.ensure_buffers(width, height)?;
 
-        // Get the device pointers for the current decode target
-        let (d_y_ptr, d_u_ptr, d_v_ptr) = match &self.mode {
-            DecodeMode::Owned { d_y, d_u, d_v, .. } => (d_y.ptr, d_u.ptr, d_v.ptr),
+        // Get the device pointers and row pitches for the current decode target.
+        // In shared mode, pitches are aligned to wgpu's COPY_BYTES_PER_ROW_ALIGNMENT
+        // so that copy_buffer_to_texture works without re-packing.
+        let (d_y_ptr, d_u_ptr, d_v_ptr, y_pitch, uv_pitch) = match &self.mode {
+            DecodeMode::Owned { d_y, d_u, d_v, .. } => {
+                (d_y.ptr, d_u.ptr, d_v.ptr, width as usize, (width / 2) as usize)
+            }
             DecodeMode::Shared { sets, current_index } => {
                 let set = &sets[*current_index];
-                (set.y.device_ptr, set.u.device_ptr, set.v.device_ptr)
+                (
+                    set.y.device_ptr,
+                    set.u.device_ptr,
+                    set.v.device_ptr,
+                    set.y_pitch as usize,
+                    set.uv_pitch as usize,
+                )
             }
         };
 
@@ -887,12 +907,7 @@ impl NvjpegDecoder {
                 d_v_ptr as *mut u8,
                 ptr::null_mut(),
             ],
-            pitch: [
-                width as usize,
-                (width / 2) as usize,
-                (width / 2) as usize,
-                0,
-            ],
+            pitch: [y_pitch, uv_pitch, uv_pitch, 0],
         };
 
         // Decode on GPU (async on CUDA stream)

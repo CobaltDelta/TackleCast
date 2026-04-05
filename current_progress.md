@@ -90,10 +90,11 @@ Webcams (e.g. Logitech C920) appear in the device list and may partially work, b
 - This is a bonus compatibility feature, not a primary use case. TackleCast is designed for capture cards.
 
 ### Laptop Performance at 120fps (RTX 3050 + i5-13420H)
-Tested with ShadowCast 3 at 1440p@120fps with zero-copy pipeline:
-- **With zero-copy (Phase 2B)**: ~118-120fps sustained over 3.5+ minutes (25,320 frames). Massive improvement from the ~80-100fps before zero-copy.
-- **Remaining bottleneck**: Occasional DirectShow buffer overflow during transient GPU load spikes (Windows compositor, background tasks). This is nvJPEG decode latency on the 3050, **not** a bandwidth issue — the PCIe round-trip has been completely eliminated.
-- **Before zero-copy**: ~80-100fps with constant buffer overflow. Root cause was GPU→CPU→GPU data round trip: `cuMemcpyDtoH` + `.to_vec()` + `queue.write_texture()` = ~2.6 GB/s through PCIe 4.0 x4.
+Tested with ShadowCast 3 with zero-copy pipeline:
+- **1440p@120fps**: 120fps sustained (with cooling pad). Without cooling, thermal throttling degrades to ~90-110fps after extended 4K sessions. Massive improvement from ~80-100fps before zero-copy.
+- **4K@60fps MJPEG**: ~58fps (up from ~48fps before zero-copy). Close to target on a laptop 3050.
+- **Thermal throttling**: After sustained heavy load (e.g. 2.5 min of 4K decode), the laptop GPU throttles and 1440p performance degrades. A cooling pad resolves this — the bottleneck is now the GPU's thermal envelope, not software bandwidth.
+- **Before zero-copy**: ~80-100fps at 1440p with constant buffer overflow. Root cause was GPU→CPU→GPU data round trip: `cuMemcpyDtoH` + `.to_vec()` + `queue.write_texture()` = ~2.6 GB/s through PCIe 4.0 x4.
 - **60fps NV12 works perfectly** on this hardware — zero decode overhead and ~330 MB/s data rate.
 - **RTX 3050 laptop has PCIe 4.0 x4** (half the bandwidth of desktop x16), which was the bottleneck before zero-copy.
 

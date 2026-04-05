@@ -40,6 +40,11 @@ pub struct SharedPlaneHandles {
     pub y_size: u64,
     pub u_size: u64,
     pub v_size: u64,
+    /// Row pitch in bytes (aligned to COPY_BYTES_PER_ROW_ALIGNMENT).
+    /// nvJPEG must use these as output pitches so the data layout matches
+    /// what wgpu expects in copy_buffer_to_texture.
+    pub y_pitch: u32,
+    pub uv_pitch: u32,
 }
 
 // SAFETY: NT handles are just opaque pointers, safe to send across threads.
@@ -55,12 +60,16 @@ pub struct SharedGpuBuffers {
 }
 
 /// Calculate buffer sizes for YUV 4:2:2 planes at the given dimensions.
-/// Returns (y_size, uv_size) in bytes, aligned to 256 bytes (D3D12 requirement).
-fn plane_sizes(width: u32, height: u32) -> (u64, u64) {
-    let align = |size: u64| -> u64 { (size + 255) & !255 };
-    let y_size = align((width as u64) * (height as u64));
-    let uv_size = align(((width / 2) as u64) * (height as u64));
-    (y_size, uv_size)
+/// Each row is aligned to `COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes) because
+/// wgpu's `copy_buffer_to_texture` requires aligned `bytes_per_row`.
+/// Returns (y_row_pitch, uv_row_pitch, y_size, uv_size).
+fn plane_sizes(width: u32, height: u32) -> (u32, u32, u64, u64) {
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let y_pitch = (width + align - 1) & !(align - 1);
+    let uv_pitch = ((width / 2) + align - 1) & !(align - 1);
+    let y_size = (y_pitch as u64) * (height as u64);
+    let uv_size = (uv_pitch as u64) * (height as u64);
+    (y_pitch, uv_pitch, y_size, uv_size)
 }
 
 impl SharedGpuBuffers {
@@ -71,11 +80,11 @@ impl SharedGpuBuffers {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        let (y_size, uv_size) = plane_sizes(width, height);
+        let (y_pitch, uv_pitch, y_size, uv_size) = plane_sizes(width, height);
 
         info!(
-            "creating shared DX12 buffers for zero-copy: {}x{} (Y={}B, UV={}B each, {} sets)",
-            width, height, y_size, uv_size, NUM_BUFFER_SETS
+            "creating shared DX12 buffers for zero-copy: {}x{} (Y={}B pitch={}, UV={}B pitch={}, {} sets)",
+            width, height, y_size, y_pitch, uv_size, uv_pitch, NUM_BUFFER_SETS
         );
 
         // Access the raw DX12 device via wgpu HAL.
@@ -134,6 +143,8 @@ impl SharedGpuBuffers {
                 y_size,
                 u_size: uv_size,
                 v_size: uv_size,
+                y_pitch,
+                uv_pitch,
             });
         }
 
