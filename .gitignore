@@ -38,3 +38,8 @@ logs/
 
 # Claude
 .claude/
+
+
+# Added by cargo
+
+/target

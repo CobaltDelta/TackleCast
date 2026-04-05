@@ -1,0 +1,34 @@
+[package]
+name = "tacklecast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+cpal = "0.15"
+crossbeam-channel = "0.5"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+ffmpeg-next = "8"
+image = "0.25"
+instant = "0.1"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+wgpu = "24"
+winit = "0.30"
+windows = { version = "0.58", features = [
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
