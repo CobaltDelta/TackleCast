@@ -432,6 +432,13 @@ fn run_directshow_capture_inner(
     let mut total_frames = 0_u64;
     let mut logged_first_frame = false;
     let mut packet_errors = 0_u32;
+
+    // Frame arrival timing
+    let mut last_packet_at: Option<Instant> = None;
+    let mut arrival_min_us = u64::MAX;
+    let mut arrival_max_us = 0_u64;
+    let mut arrival_sum_us = 0_u64;
+    let mut arrival_count = 0_u64;
     let mut scaler: Option<ScaleContext> = None;
     let mut scaled_frame = Video::empty();
 
@@ -487,6 +494,17 @@ fn run_directshow_capture_inner(
             continue;
         }
 
+        // Track frame arrival timing
+        let now = Instant::now();
+        if let Some(prev) = last_packet_at {
+            let interval_us = now.duration_since(prev).as_micros() as u64;
+            arrival_min_us = arrival_min_us.min(interval_us);
+            arrival_max_us = arrival_max_us.max(interval_us);
+            arrival_sum_us += interval_us;
+            arrival_count += 1;
+        }
+        last_packet_at = Some(now);
+
         // Try GPU decode first when available (MJPEG only)
         #[cfg(feature = "gpu-decode")]
         if let Some(ref mut gpu) = gpu_decoder {
@@ -522,12 +540,24 @@ fn run_directshow_capture_inner(
                         let summary_elapsed = last_summary_at.elapsed();
                         if summary_elapsed >= Duration::from_secs(30) {
                             let avg_fps = summary_frame_counter as f64 / summary_elapsed.as_secs_f64();
+                            let arrival_info = if arrival_count > 0 {
+                                let avg_ms = (arrival_sum_us as f64 / arrival_count as f64) / 1000.0;
+                                let min_ms = arrival_min_us as f64 / 1000.0;
+                                let max_ms = arrival_max_us as f64 / 1000.0;
+                                format!(", frame_arrival: avg={:.1}ms min={:.1}ms max={:.1}ms", avg_ms, min_ms, max_ms)
+                            } else {
+                                String::new()
+                            };
                             info!(
-                                "decode summary: {} total frames, {:.1} avg fps (GPU), {}x{}, device='{}'",
-                                total_frames, avg_fps, width, height, device_name
+                                "decode summary: {} total frames, {:.1} avg fps (GPU), {}x{}, device='{}'{}",
+                                total_frames, avg_fps, width, height, device_name, arrival_info
                             );
                             last_summary_at = Instant::now();
                             summary_frame_counter = 0;
+                            arrival_min_us = u64::MAX;
+                            arrival_max_us = 0;
+                            arrival_sum_us = 0;
+                            arrival_count = 0;
                         }
                         continue; // skip software decode
                     }
@@ -600,12 +630,24 @@ fn run_directshow_capture_inner(
             let summary_elapsed = last_summary_at.elapsed();
             if summary_elapsed >= Duration::from_secs(30) {
                 let avg_fps = summary_frame_counter as f64 / summary_elapsed.as_secs_f64();
+                let arrival_info = if arrival_count > 0 {
+                    let avg_ms = (arrival_sum_us as f64 / arrival_count as f64) / 1000.0;
+                    let min_ms = arrival_min_us as f64 / 1000.0;
+                    let max_ms = arrival_max_us as f64 / 1000.0;
+                    format!(", frame_arrival: avg={:.1}ms min={:.1}ms max={:.1}ms", avg_ms, min_ms, max_ms)
+                } else {
+                    String::new()
+                };
                 info!(
-                    "decode summary: {} total frames, {:.1} avg fps (SW), {}x{}, packet_errors={}, device='{}'",
-                    total_frames, avg_fps, width, height, packet_errors, device_name
+                    "decode summary: {} total frames, {:.1} avg fps (SW), {}x{}, packet_errors={}, device='{}'{}",
+                    total_frames, avg_fps, width, height, packet_errors, device_name, arrival_info
                 );
                 last_summary_at = Instant::now();
                 summary_frame_counter = 0;
+                arrival_min_us = u64::MAX;
+                arrival_max_us = 0;
+                arrival_sum_us = 0;
+                arrival_count = 0;
             }
         }
     }

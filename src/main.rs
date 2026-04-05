@@ -7,6 +7,8 @@ mod devices;
 mod dx12_interop;
 #[cfg(feature = "gpu-decode")]
 mod gpu_decode;
+#[cfg(feature = "gpu-decode")]
+mod gpu_monitor;
 mod logger;
 mod render;
 mod settings;
@@ -134,6 +136,8 @@ struct App {
     render_frame_counter: u64,
     render_frames_uploaded: u64,
     last_render_summary: Instant,
+    #[cfg(feature = "gpu-decode")]
+    gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
 
 impl App {
@@ -164,6 +168,8 @@ impl App {
             render_frame_counter: 0,
             render_frames_uploaded: 0,
             last_render_summary: Instant::now(),
+            #[cfg(feature = "gpu-decode")]
+            gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
     }
 
@@ -370,11 +376,18 @@ impl ApplicationHandler for App {
         if render_elapsed >= std::time::Duration::from_secs(30) {
             let render_fps = self.render_frame_counter as f64 / render_elapsed.as_secs_f64();
             let upload_fps = self.render_frames_uploaded as f64 / render_elapsed.as_secs_f64();
+
+            #[cfg(feature = "gpu-decode")]
+            let gpu_info = self.gpu_monitor.as_ref().map(|m| format!(", {}", m.snapshot()));
+            #[cfg(not(feature = "gpu-decode"))]
+            let gpu_info: Option<String> = None;
+
             info!(
-                "render summary: {:.1} rendered fps, {:.1} uploaded fps, decode fps={:.1}",
+                "render summary: {:.1} rendered fps, {:.1} uploaded fps, decode fps={:.1}{}",
                 render_fps,
                 upload_fps,
                 self.latest_stats.map(|s| s.fps).unwrap_or(0.0),
+                gpu_info.as_deref().unwrap_or(""),
             );
             self.render_frame_counter = 0;
             self.render_frames_uploaded = 0;
