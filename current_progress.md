@@ -101,12 +101,24 @@ Tested with ShadowCast 3 with zero-copy pipeline:
 ### Color Range Mismatch Between NV12 and MJPEG Modes (TODO)
 At 60fps the capture card sends NV12 (limited range YUV, 16-235). At 120fps it sends MJPEG which decodes to Yuvj422p (full range YUV, 0-255 — the "j" means JPEG/full range). The YUV-to-RGB shader currently treats both the same, causing colors to look duller in MJPEG/120fps mode compared to NV12/60fps mode. Fix: pass the pixel format through to the shader and apply the correct YUV-to-RGB matrix for each range (BT.601 limited vs full).
 
+### ShadowCast 2 Pro: Thermal Throttling at 1440p@120 MJPEG
+The ShadowCast 2 Pro's internal MJPEG encoder thermally throttles under sustained 1440p@120fps load. Confirmed via frame arrival timing diagnostics:
+- **Cold start**: Delivers ~105-120fps (8.3ms frame intervals) for the first 1-2 minutes
+- **Throttled**: Degrades to ~60fps (16.4ms frame intervals) over 2-4 minutes
+- **Recovery**: May recover back to 120fps after running throttled for several minutes, then cycle again
+- **GPU is not the bottleneck**: RTX 4070 Ti stays at 43-47C and 50-55% utilization throughout. The frames simply stop arriving faster than 60fps from the capture card
+- **Cooling helps**: Unplugging the device for 5 minutes and letting it cool extends the initial 120fps window
+- **1080p@120 is unaffected**: At 1080p the ShadowCast 2 Pro sends NV12 (raw, no encode), bypassing the MJPEG encoder entirely. Solid 120fps.
+- **ShadowCast 3 does not have this issue**: Sustains 1440p@120 MJPEG indefinitely on the same software
+
+This is a hardware limitation of the ShadowCast 2 Pro's encoder chip (small passthrough dongle, no active cooling). Not fixable in software.
+
 ### Friend's Testing (ShadowCast 2 Pro + RTX 4070 Ti + i7-12700)
 - GPU decode requires NVIDIA driver 570+ for CUDA 13 compatibility
 - ShadowCast 2 Pro silently falls back to NV12 at 1080p@120 (only 1440p@120 uses MJPEG)
 - Software MJPEG decode at 1440p@120 was ~40fps on i7-12700 (too slow without GPU decode)
 - nvJPEG DLLs (nvjpeg64_13.dll + cudart64_13.dll) must be bundled alongside the exe for GPU decode
-- 1440p@120 MJPEG with GPU decode: capture card delivering ~62fps despite 120fps request — under investigation (may be DirectShow negotiation issue or source signal)
+- See "ShadowCast 2 Pro: Thermal Throttling" above for 1440p@120 performance details
 
 ## Build Environment
 

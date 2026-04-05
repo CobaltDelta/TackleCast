@@ -75,6 +75,14 @@ src/
   logger.rs        - Rotating file logger via tracing
 ```
 
+## Known Limitations
+
+- **GPU decode is NVIDIA-only** (AMD AMF and Intel Quick Sync planned for a future release). Non-NVIDIA GPUs fall back to software decode automatically.
+- **Windows only** (DirectShow capture, WASAPI audio, DX12 rendering).
+- **Some capture cards may throttle at high framerates.** Smaller USB passthrough dongles (e.g. Genki ShadowCast 2 Pro) can thermally throttle their internal MJPEG encoder at sustained 1440p@120fps, causing frame delivery to drop to ~60fps. This is a hardware limitation, not a software issue. Devices with better thermal design (e.g. ShadowCast 3) are unaffected.
+- Laptop GPUs may thermal throttle at sustained 4K@60fps or 1440p@120fps (a cooling pad helps).
+- Webcams may partially work but are not officially supported.
+
 ## Acknowledgments
 
 - **[@NeverForgetful](https://www.youtube.com/@NeverForgetful)** - Testing and QA
