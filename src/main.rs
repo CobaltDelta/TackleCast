@@ -14,6 +14,7 @@ mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use audio::AudioPassthrough;
 use capture::{CaptureConfig, CaptureSource, CaptureStats, CaptureThread, PixelFormat};
@@ -130,6 +131,9 @@ struct App {
     latest_error: Option<String>,
     is_fullscreen: bool,
     is_minimized: bool,
+    render_frame_counter: u64,
+    render_frames_uploaded: u64,
+    last_render_summary: Instant,
 }
 
 impl App {
@@ -157,6 +161,9 @@ impl App {
             latest_error: None,
             is_fullscreen: false,
             is_minimized: false,
+            render_frame_counter: 0,
+            render_frames_uploaded: 0,
+            last_render_summary: Instant::now(),
         }
     }
 
@@ -294,6 +301,7 @@ impl ApplicationHandler for App {
                     if let Err(error) = renderer.render(Some(prepared_ui)) {
                         error!("render error: {error}");
                     }
+                    self.render_frame_counter += 1;
                     if toggle_fullscreen {
                         self.toggle_fullscreen();
                     }
@@ -321,6 +329,7 @@ impl ApplicationHandler for App {
             if let Some(frame) = capture.latest_frame() {
                 self.latest_error = None;
                 renderer.upload_frame(&frame);
+                self.render_frames_uploaded += 1;
             }
 
             if let Some(stats) = capture.latest_stats() {
@@ -354,6 +363,22 @@ impl ApplicationHandler for App {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
+        }
+
+        // Periodic render summary (every 30s)
+        let render_elapsed = self.last_render_summary.elapsed();
+        if render_elapsed >= std::time::Duration::from_secs(30) {
+            let render_fps = self.render_frame_counter as f64 / render_elapsed.as_secs_f64();
+            let upload_fps = self.render_frames_uploaded as f64 / render_elapsed.as_secs_f64();
+            info!(
+                "render summary: {:.1} rendered fps, {:.1} uploaded fps, decode fps={:.1}",
+                render_fps,
+                upload_fps,
+                self.latest_stats.map(|s| s.fps).unwrap_or(0.0),
+            );
+            self.render_frame_counter = 0;
+            self.render_frames_uploaded = 0;
+            self.last_render_summary = Instant::now();
         }
     }
 }

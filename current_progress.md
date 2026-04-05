@@ -98,11 +98,15 @@ Tested with ShadowCast 3 with zero-copy pipeline:
 - **60fps NV12 works perfectly** on this hardware — zero decode overhead and ~330 MB/s data rate.
 - **RTX 3050 laptop has PCIe 4.0 x4** (half the bandwidth of desktop x16), which was the bottleneck before zero-copy.
 
-### Friend's Testing (ShadowCast 2 Pro + RTX 4080 + i7-12700)
+### Color Range Mismatch Between NV12 and MJPEG Modes (TODO)
+At 60fps the capture card sends NV12 (limited range YUV, 16-235). At 120fps it sends MJPEG which decodes to Yuvj422p (full range YUV, 0-255 — the "j" means JPEG/full range). The YUV-to-RGB shader currently treats both the same, causing colors to look duller in MJPEG/120fps mode compared to NV12/60fps mode. Fix: pass the pixel format through to the shader and apply the correct YUV-to-RGB matrix for each range (BT.601 limited vs full).
+
+### Friend's Testing (ShadowCast 2 Pro + RTX 4070 Ti + i7-12700)
 - GPU decode requires NVIDIA driver 570+ for CUDA 13 compatibility
 - ShadowCast 2 Pro silently falls back to NV12 at 1080p@120 (only 1440p@120 uses MJPEG)
 - Software MJPEG decode at 1440p@120 was ~40fps on i7-12700 (too slow without GPU decode)
 - nvJPEG DLLs (nvjpeg64_13.dll + cudart64_13.dll) must be bundled alongside the exe for GPU decode
+- 1440p@120 MJPEG with GPU decode: capture card delivering ~62fps despite 120fps request — under investigation (may be DirectShow negotiation issue or source signal)
 
 ## Build Environment
 

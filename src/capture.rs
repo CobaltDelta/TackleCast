@@ -402,8 +402,32 @@ fn run_directshow_capture_inner(
         .video()
         .map_err(|error| format!("failed to open video decoder: {error}"))?;
 
+    // Log actual stream parameters vs requested
+    let actual_rate = input_stream.rate();
+    let actual_fps_f64 = if actual_rate.1 > 0 {
+        actual_rate.0 as f64 / actual_rate.1 as f64
+    } else {
+        0.0
+    };
+    let actual_width = decoder.width();
+    let actual_height = decoder.height();
+    info!(
+        "stream negotiated: {}x{} @ {:.2}fps (time_base={}/{}), requested: {}x{} @ {}fps",
+        actual_width, actual_height, actual_fps_f64,
+        actual_rate.0, actual_rate.1,
+        requested_width, requested_height, requested_fps,
+    );
+    if (actual_fps_f64 - requested_fps as f64).abs() > 1.0 && actual_fps_f64 > 0.0 {
+        warn!(
+            "stream framerate mismatch: requested {}fps but device negotiated {:.1}fps",
+            requested_fps, actual_fps_f64
+        );
+    }
+
     let mut decoded = Video::empty();
     let mut last_stats_at = Instant::now();
+    let mut last_summary_at = Instant::now();
+    let mut summary_frame_counter = 0_u64;
     let mut stats_frame_counter = 0_u32;
     let mut total_frames = 0_u64;
     let mut logged_first_frame = false;
@@ -481,24 +505,29 @@ fn run_directshow_capture_inner(
                                 device_name, width, height, frame.format()
                             );
                         }
-                        if total_frames.is_multiple_of(120) {
-                            info!(
-                                "GPU-decoded {} frames from '{}' (latest {}x{})",
-                                total_frames, device_name, width, height
-                            );
-                        }
 
                         if frame_tx.send(frame).is_err() {
                             return Ok(());
                         }
 
                         stats_frame_counter += 1;
+                        summary_frame_counter += 1;
                         let elapsed = last_stats_at.elapsed();
                         if elapsed >= Duration::from_millis(300) {
                             let fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
                             let _ = stats_tx.send(CaptureStats { fps, width, height });
                             last_stats_at = Instant::now();
                             stats_frame_counter = 0;
+                        }
+                        let summary_elapsed = last_summary_at.elapsed();
+                        if summary_elapsed >= Duration::from_secs(30) {
+                            let avg_fps = summary_frame_counter as f64 / summary_elapsed.as_secs_f64();
+                            info!(
+                                "decode summary: {} total frames, {:.1} avg fps (GPU), {}x{}, device='{}'",
+                                total_frames, avg_fps, width, height, device_name
+                            );
+                            last_summary_at = Instant::now();
+                            summary_frame_counter = 0;
                         }
                         continue; // skip software decode
                     }
@@ -554,24 +583,29 @@ fn run_directshow_capture_inner(
                     device_name, width, height, frame.format()
                 );
             }
-            if total_frames.is_multiple_of(120) {
-                info!(
-                    "decoded {} frames from '{}' (latest {}x{}, packet errors={})",
-                    total_frames, device_name, width, height, packet_errors
-                );
-            }
 
             if frame_tx.send(frame).is_err() {
                 return Ok(());
             }
 
             stats_frame_counter += 1;
+            summary_frame_counter += 1;
             let elapsed = last_stats_at.elapsed();
             if elapsed >= Duration::from_millis(300) {
                 let fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
                 let _ = stats_tx.send(CaptureStats { fps, width, height });
                 last_stats_at = Instant::now();
                 stats_frame_counter = 0;
+            }
+            let summary_elapsed = last_summary_at.elapsed();
+            if summary_elapsed >= Duration::from_secs(30) {
+                let avg_fps = summary_frame_counter as f64 / summary_elapsed.as_secs_f64();
+                info!(
+                    "decode summary: {} total frames, {:.1} avg fps (SW), {}x{}, packet_errors={}, device='{}'",
+                    total_frames, avg_fps, width, height, packet_errors, device_name
+                );
+                last_summary_at = Instant::now();
+                summary_frame_counter = 0;
             }
         }
     }
