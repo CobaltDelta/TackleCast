@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub const FPS_MODE_30: &str = "30";
 pub const FPS_MODE_60: &str = "60";
 pub const FPS_MODE_120: &str = "120";
 #[allow(dead_code)]
@@ -77,10 +78,34 @@ impl Settings {
 
     pub fn get_fps(&self) -> u32 {
         match self.fps_mode.as_str() {
+            FPS_MODE_30 => 30,
             FPS_MODE_60 => 60,
             FPS_MODE_120 => 120,
             _ => self.custom_fps.clamp(MIN_FPS, MAX_FPS),
         }
+    }
+
+    /// Update resolution and fps_mode to reflect what the capture device
+    /// actually negotiated (e.g. after fallback to a lower resolution/fps).
+    pub fn apply_negotiated(&mut self, width: u32, height: u32, fps: u32) {
+        let new_resolution = match (width, height) {
+            (3840, 2160) => "4K",
+            (2560, 1440) => "1440p",
+            (1280, 720) => "720p",
+            _ => "1080p",
+        };
+        let new_fps_mode = match fps {
+            30 => FPS_MODE_30,
+            120 => FPS_MODE_120,
+            60 => FPS_MODE_60,
+            other => {
+                self.custom_fps = other;
+                FPS_MODE_CUSTOM
+            }
+        };
+
+        self.resolution = new_resolution.to_string();
+        self.fps_mode = new_fps_mode.to_string();
     }
 }
 

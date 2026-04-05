@@ -1,0 +1,120 @@
+# TackleCast — Current Progress
+
+Last updated: 2026-04-05
+
+## What is TackleCast?
+
+A lightweight, GPU-accelerated capture card viewer for Windows, written in Rust. Designed for low-latency video passthrough from devices like Genki ShadowCast, Elgato, AVerMedia, and other UVC capture cards. Outputs video to a resizable window with an in-app settings menu and FPS overlay.
+
+## Architecture
+
+```
+src/
+  main.rs          — winit event loop, app state, settings application
+  capture.rs       — DirectShow capture via ffmpeg-next, format/resolution fallback
+  gpu_decode.rs    — NVIDIA nvJPEG GPU MJPEG decode (feature-gated: gpu-decode)
+  render.rs        — wgpu renderer, YUV->RGB WGSL shader, aspect-ratio letterboxing
+  audio.rs         — WASAPI audio passthrough via cpal (input->output with volume)
+  ui.rs            — egui overlay pill + settings pause menu
+  devices.rs       — DirectShow video + WASAPI audio device enumeration
+  settings.rs      — JSON settings load/save (compatible with original Python format)
+  logger.rs        — Rotating file logger via tracing
+assets/
+  icon.ico         — Window icon
+```
+
+## Completed Features
+
+### Phase 1: Software Decode (Complete)
+- wgpu GPU rendering with YUV->RGB WGSL shader
+- egui settings menu (Escape to open) and FPS overlay
+- ffmpeg-next DirectShow capture with MJPEG/NV12 decode
+- cpal WASAPI audio passthrough with volume control
+- Settings compatible with original Python JSON format
+- Test pattern mode (`--test`, `--test-nv12`, `--test-yuvj422p`, `--test-alt`)
+- Capture buffer tuning: `rtbufsize=16MB`, decode thread at `THREAD_PRIORITY_ABOVE_NORMAL`
+- Pixel format fallback: tries nv12 -> mjpeg -> yuyv422 -> uyvy422 -> yuv420p -> auto
+- Resolution/FPS fallback: automatically tries lower resolutions and framerates when device rejects requested settings
+- Negotiated settings feedback: when fallback occurs, UI updates to show actual capture parameters
+- Software pixel format conversion via ffmpeg swscale for unsupported decoder outputs
+- F11 fullscreen toggle, window icon, minimize behavior, DPI-aware
+
+### Phase 2A: GPU-Accelerated MJPEG Decode (Complete)
+- NVIDIA nvJPEG via CUDA for GPU JPEG decode (tested at 1440p@120fps)
+- `src/gpu_decode.rs` — pure `libloading` dynamic loading of nvcuda.dll + nvjpeg64_*.dll
+- No CUDA SDK needed at build time; DLLs loaded at runtime
+- Automatic fallback to software decode when CUDA/nvJPEG unavailable
+- Feature-gated: `gpu-decode` (default on), `--no-default-features` for software-only
+- Searches CUDA Toolkit install paths if DLLs not on system PATH
+- **DHT injection**: Automatically injects standard JPEG Huffman tables into UVC MJPEG streams that omit them (per UVC spec). Zero-copy fast path when DHT already present. Ensures compatibility with Elgato, AVerMedia, cheap USB dongles, and other capture cards beyond ShadowCast.
+
+### Settings Menu (30/60/120/Custom FPS)
+- Frame rate dropdown: 30 FPS, 60 FPS, 120 FPS, Custom (30-240)
+- Resolution dropdown: 720p, 1080p, 1440p, 4K
+- Video device, audio input/output, volume slider
+- Fullscreen toggle, FPS overlay toggle
+- Exit button
+- Settings applied on menu close (snapshot/apply pattern)
+
+## Known Issues
+
+### Webcam / Non-Capture-Card Devices
+Webcams (e.g. Logitech C920) appear in the device list and may partially work, but are **not officially supported**. Known problems:
+- Many webcams only support high framerates via H.264, not MJPEG. H.264 over DirectShow/UVC has packet framing issues that cause decode artifacts ("No start code found", corrupted macroblocks).
+- The resolution/FPS fallback will find a working mode, but H.264 streams may show visual corruption.
+- MJPEG modes on webcams typically max out at 30fps at 1080p. The app will auto-negotiate to a supported mode.
+- This is a bonus compatibility feature, not a primary use case. TackleCast is designed for capture cards.
+
+### Friend's Testing (ShadowCast 2 Pro + RTX 4080 + i7-12700)
+- GPU decode requires NVIDIA driver 570+ for CUDA 13 compatibility
+- ShadowCast 2 Pro silently falls back to NV12 at 1080p@120 (only 1440p@120 uses MJPEG)
+- Software MJPEG decode at 1440p@120 was ~40fps on i7-12700 (too slow without GPU decode)
+- nvJPEG DLLs (nvjpeg64_13.dll + cudart64_13.dll) must be bundled alongside the exe for GPU decode
+
+## Build Environment
+
+### Prerequisites
+- **Rust toolchain**: `C:\Users\Aluca\.cargo\bin`
+- **FFmpeg**: `C:\ffmpeg` (set `FFMPEG_DIR`, add `bin` to PATH)
+- **LLVM/libclang**: `C:\Program Files\LLVM\bin` (set `LIBCLANG_PATH`)
+- **CUDA Toolkit 13.2**: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2` (optional, for GPU decode development)
+- Uses `ffmpeg-next = "8"` (not 7 — header compatibility issue with avfft.h)
+
+### Build Commands
+```bash
+cargo build              # debug build
+cargo build --release    # release build
+cargo test               # run tests
+cargo run -- --test      # test pattern mode (no capture card needed)
+```
+
+### Distribution
+- Release exe + FFmpeg DLLs + nvJPEG DLLs (for GPU decode)
+- Packaging script: `scripts/package_rust_release.ps1`
+- GPU decode bundle: `dist/TackleCast-GPU-Decode/`
+- See `BUILD.md` for full packaging details
+
+## Next Steps
+
+### Phase 2B: Zero-Copy GPU Pipeline (Future)
+Eliminate the GPU->CPU->GPU round trip that currently happens after nvJPEG decode:
+- nvJPEG decode outputs to CUDA device memory
+- Export CUDA memory as DX12 shared handle
+- Import into wgpu via HAL interop
+- Frame data never touches CPU after decode
+
+This requires unsafe wgpu HAL code and DX12 interop. Not urgent — Phase 2A performance is already excellent at 1440p@120fps on RTX 5080.
+
+### Multi-Vendor GPU Decode Support
+Currently GPU decode is NVIDIA-only (nvJPEG/CUDA). Future work to support:
+- **AMD**: Investigate AMD AMF (Advanced Media Framework) or Mesa VA-API for MJPEG decode on Radeon GPUs
+- **Intel**: Intel Quick Sync / oneVPL for integrated and Arc GPUs
+- **Portable fallback**: Investigate Vulkan Video extensions as a cross-vendor decode path
+
+Each vendor path would follow the same pattern as nvJPEG: dynamic library loading at runtime, automatic fallback to software decode when unavailable, no SDK required at build time.
+
+### Other Future Work
+- Broader hardware validation across more capture card brands
+- UI/menu polish pass based on live feedback
+- Release automation and versioned packaging workflow
+- Audio polish and edge case handling

@@ -327,6 +327,23 @@ impl ApplicationHandler for App {
                 self.latest_error = Some(error_message.clone());
                 warn!("capture error: {error_message}");
             }
+
+            // If the capture thread fell back to a different resolution/fps,
+            // update settings to reflect what's actually running.
+            if let Some(negotiated) = capture.latest_negotiated() {
+                info!(
+                    "updating settings to match negotiated capture: {}x{} @ {}fps",
+                    negotiated.width, negotiated.height, negotiated.fps
+                );
+                self.settings.apply_negotiated(
+                    negotiated.width,
+                    negotiated.height,
+                    negotiated.fps,
+                );
+                if let Err(error) = self.settings.save() {
+                    error!("failed to save negotiated settings: {error}");
+                }
+            }
         }
 
         if !self.is_minimized {

@@ -41,6 +41,15 @@ pub struct CaptureStats {
     pub height: u32,
 }
 
+/// Sent once when the capture thread successfully opens a device at settings
+/// different from what was originally requested (resolution/fps fallback).
+#[derive(Debug, Clone, Copy)]
+pub struct NegotiatedConfig {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub width: u32,
@@ -66,6 +75,7 @@ pub struct CaptureThread {
     frame_rx: Receiver<CaptureFrame>,
     stats_rx: Receiver<CaptureStats>,
     error_rx: Receiver<String>,
+    negotiated_rx: Receiver<NegotiatedConfig>,
     stop_flag: Arc<AtomicBool>,
     join_handle: Option<JoinHandle<()>>,
 }
@@ -75,6 +85,7 @@ impl CaptureThread {
         let (frame_tx, frame_rx) = unbounded();
         let (stats_tx, stats_rx) = unbounded();
         let (error_tx, error_rx) = unbounded();
+        let (negotiated_tx, negotiated_rx) = unbounded();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop_flag = stop_flag.clone();
 
@@ -107,6 +118,7 @@ impl CaptureThread {
                 frame_tx,
                 stats_tx,
                 error_tx,
+                negotiated_tx,
             ),
         });
 
@@ -114,6 +126,7 @@ impl CaptureThread {
             frame_rx,
             stats_rx,
             error_rx,
+            negotiated_rx,
             stop_flag,
             join_handle: Some(join_handle),
         }
@@ -129,6 +142,10 @@ impl CaptureThread {
 
     pub fn latest_error(&self) -> Option<String> {
         self.error_rx.try_iter().last()
+    }
+
+    pub fn latest_negotiated(&self) -> Option<NegotiatedConfig> {
+        self.negotiated_rx.try_iter().last()
     }
 
     pub fn stop(&mut self) {
@@ -206,43 +223,71 @@ fn run_directshow_capture(
     frame_tx: Sender<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
     error_tx: Sender<String>,
+    negotiated_tx: Sender<NegotiatedConfig>,
 ) {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     ffmpeg::log::set_level(ffmpeg::log::Level::Error);
 
-    let attempt_formats = pixel_format_attempts(&requested_pixel_format);
+    // Build list of (width, height, fps) tiers to try. Start with the
+    // requested settings, then fall back to common resolutions/framerates
+    // that most USB capture devices and webcams support.
+    let resolution_tiers = resolution_fallback_tiers(
+        requested_width,
+        requested_height,
+        requested_fps,
+    );
+
     let mut last_error: Option<String> = None;
-    for format_attempt in attempt_formats {
-        if stop_flag.load(Ordering::Relaxed) {
-            return;
-        }
 
-        let format_label = format_attempt.as_deref().unwrap_or("auto");
-        info!(
-            "capture attempt: device='{}' format='{}' {}x{} @ {}fps",
-            device_name, format_label, requested_width, requested_height, requested_fps
-        );
+    for &(try_w, try_h, try_fps) in &resolution_tiers {
+        let attempt_formats = pixel_format_attempts(&requested_pixel_format);
 
-        match run_directshow_capture_inner(
-            &device_name,
-            requested_width,
-            requested_height,
-            requested_fps,
-            format_attempt.as_deref(),
-            decode_threads,
-            stop_flag.clone(),
-            frame_tx.clone(),
-            stats_tx.clone(),
-        ) {
-            Ok(()) => return,
-            Err(error) => {
-                warn!(
-                    "capture attempt failed: device='{}' format='{}' error={}",
-                    device_name, format_label, error
-                );
-                last_error = Some(error);
+        for format_attempt in attempt_formats {
+            if stop_flag.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let format_label = format_attempt.as_deref().unwrap_or("auto");
+            info!(
+                "capture attempt: device='{}' format='{}' {}x{} @ {}fps",
+                device_name, format_label, try_w, try_h, try_fps
+            );
+
+            match run_directshow_capture_inner(
+                &device_name,
+                try_w,
+                try_h,
+                try_fps,
+                format_attempt.as_deref(),
+                decode_threads,
+                stop_flag.clone(),
+                frame_tx.clone(),
+                stats_tx.clone(),
+            ) {
+                Ok(()) => {
+                    // Notify if we fell back to different settings
+                    if try_w != requested_width || try_h != requested_height || try_fps != requested_fps {
+                        info!(
+                            "capture negotiated fallback: {}x{} @ {}fps (requested {}x{} @ {}fps)",
+                            try_w, try_h, try_fps, requested_width, requested_height, requested_fps
+                        );
+                        let _ = negotiated_tx.send(NegotiatedConfig {
+                            width: try_w,
+                            height: try_h,
+                            fps: try_fps,
+                        });
+                    }
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        "capture attempt failed: device='{}' format='{}' {}x{} @ {}fps error={}",
+                        device_name, format_label, try_w, try_h, try_fps, error
+                    );
+                    last_error = Some(error);
+                }
             }
         }
     }
@@ -558,6 +603,47 @@ fn extract_supported_frame_with_format(
         u_data,
         v_data,
     })
+}
+
+/// Build an ordered list of (width, height, fps) to try. Starts with the
+/// requested settings, then appends common fallback tiers — halved fps at
+/// the same resolution, then standard lower resolutions at 60/30 fps.
+/// Duplicates of the original request are excluded.
+fn resolution_fallback_tiers(width: u32, height: u32, fps: u32) -> Vec<(u32, u32, u32)> {
+    let mut tiers: Vec<(u32, u32, u32)> = Vec::new();
+    let mut push = |w, h, f| {
+        if !tiers.contains(&(w, h, f)) {
+            tiers.push((w, h, f));
+        }
+    };
+
+    // Tier 0: exactly what the user asked for
+    push(width, height, fps);
+
+    // Tier 1: same resolution at half fps (e.g. 1080p120 -> 1080p60, 1080p60 -> 1080p30)
+    if fps > 30 {
+        push(width, height, fps / 2);
+    }
+    // Tier 2: same resolution at 30fps
+    if fps != 30 {
+        push(width, height, 30);
+    }
+
+    // Tier 3: standard fallback resolutions
+    let fallbacks: &[(u32, u32)] = &[
+        (1920, 1080),
+        (1280, 720),
+        (640, 480),
+    ];
+    for &(fw, fh) in fallbacks {
+        if fw >= width && fh >= height {
+            continue; // skip resolutions >= what we already tried
+        }
+        push(fw, fh, 60);
+        push(fw, fh, 30);
+    }
+
+    tiers
 }
 
 fn pixel_format_attempts(requested_pixel_format: &str) -> Vec<Option<String>> {

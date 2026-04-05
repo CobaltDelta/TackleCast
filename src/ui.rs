@@ -1,5 +1,5 @@
 use crate::devices::AudioDevice;
-use crate::settings::{Settings, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
+use crate::settings::{Settings, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
 use egui::{
     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
     Margin, RichText, Slider, Stroke,
@@ -415,11 +415,13 @@ fn fps_mode_combo(ui: &mut egui::Ui, fps_mode: &mut String) {
     ComboBox::from_id_salt("fps_mode")
         .width(ui.available_width())
         .selected_text(match fps_mode.as_str() {
+            FPS_MODE_30 => "30 FPS",
             FPS_MODE_120 => "120 FPS",
             FPS_MODE_CUSTOM => "Custom",
             _ => "60 FPS",
         })
         .show_ui(ui, |ui| {
+            ui.selectable_value(fps_mode, FPS_MODE_30.to_string(), "30 FPS");
             ui.selectable_value(fps_mode, FPS_MODE_60.to_string(), "60 FPS");
             ui.selectable_value(fps_mode, FPS_MODE_120.to_string(), "120 FPS");
             ui.selectable_value(fps_mode, FPS_MODE_CUSTOM.to_string(), "Custom");
