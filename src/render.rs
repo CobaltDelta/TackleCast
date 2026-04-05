@@ -6,6 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use egui_wgpu::Renderer as EguiRenderer;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+use tracing::info;
 use wgpu::{CompositeAlphaMode, PresentMode, SurfaceConfiguration, TextureUsages};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -92,8 +93,14 @@ impl Renderer {
                 .present_modes
                 .iter()
                 .copied()
-                .find(|mode| *mode == PresentMode::AutoVsync)
-                .unwrap_or(PresentMode::Fifo),
+                .find(|mode| *mode == PresentMode::Mailbox)
+                .or_else(|| {
+                    caps.present_modes
+                        .iter()
+                        .copied()
+                        .find(|mode| *mode == PresentMode::Immediate)
+                })
+                .unwrap_or(PresentMode::AutoVsync),
             alpha_mode: caps
                 .alpha_modes
                 .iter()
@@ -104,6 +111,7 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
+        info!("present mode: {:?}", config.present_mode);
         surface.configure(&device, &config);
 
         let video_bind_group_layout =
