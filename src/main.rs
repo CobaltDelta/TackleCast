@@ -12,6 +12,7 @@ mod gpu_monitor;
 mod logger;
 mod render;
 mod settings;
+mod triple_buffer;
 mod ui;
 
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes};
 
@@ -38,6 +39,13 @@ const WINDOW_TITLE: &str = "TackleCast";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 const APP_ID: &str = "tacklecast.tacklecast.v1";
+
+/// Events sent from background threads to the winit event loop.
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    /// The capture thread has published a new frame to the triple buffer.
+    FrameReady,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum TestPatternMode {
@@ -104,7 +112,10 @@ fn main() {
     info!("audio inputs: {:?}", audio_inputs);
     info!("audio outputs: {:?}", audio_outputs);
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
+    let event_proxy = event_loop.create_proxy();
     let cli = CliArgs::parse();
     let mut app = App::new(
         settings,
@@ -113,6 +124,7 @@ fn main() {
         video_devices,
         audio_inputs,
         audio_outputs,
+        event_proxy,
     );
     event_loop.run_app(&mut app).expect("event loop error");
 }
@@ -124,6 +136,7 @@ struct App {
     video_devices: Vec<String>,
     audio_inputs: Vec<AudioDevice>,
     audio_outputs: Vec<AudioDevice>,
+    event_proxy: EventLoopProxy<AppEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     ui: Option<UiState>,
@@ -151,6 +164,7 @@ impl App {
         video_devices: Vec<String>,
         audio_inputs: Vec<AudioDevice>,
         audio_outputs: Vec<AudioDevice>,
+        event_proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
         Self {
             settings,
@@ -159,6 +173,7 @@ impl App {
             video_devices,
             audio_inputs,
             audio_outputs,
+            event_proxy,
             window: None,
             renderer: None,
             ui: None,
@@ -257,7 +272,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -330,7 +345,9 @@ impl ApplicationHandler for App {
         }
 
         if let Some(ui) = &mut self.ui {
-            ui.on_window_event(window, &event);
+            if ui.is_menu_open() {
+                ui.on_window_event(window, &event);
+            }
         }
 
         match event {
@@ -412,14 +429,39 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let (Some(capture), Some(renderer)) = (&self.capture, &mut self.renderer) {
-            if let Some(frame) = capture.latest_frame() {
-                self.latest_error = None;
-                renderer.upload_frame(&frame);
-                self.render_frames_uploaded += 1;
-            }
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::FrameReady => {
+                // A new frame is available in the triple buffer — read it and
+                // request a redraw. This is the event-driven replacement for
+                // the old unconditional request_redraw() spin loop.
+                let mut uploaded = false;
+                if let Some(capture) = &mut self.capture {
+                    if let Some(frame) = capture.latest_frame() {
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.upload_frame(&frame);
+                            uploaded = true;
+                        }
+                    }
+                }
+                if uploaded {
+                    self.latest_error = None;
+                    self.render_frames_uploaded += 1;
+                }
 
+                if !self.is_minimized {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Poll non-frame channels (stats, errors, negotiation).
+        // These are low-frequency and don't need event-driven wakeup.
+        if let Some(capture) = &mut self.capture {
             if let Some(stats) = capture.latest_stats() {
                 self.latest_stats = Some(stats);
             }
@@ -444,12 +486,6 @@ impl ApplicationHandler for App {
                 if let Err(error) = self.settings.save() {
                     error!("failed to save negotiated settings: {error}");
                 }
-            }
-        }
-
-        if !self.is_minimized {
-            if let Some(window) = &self.window {
-                window.request_redraw();
             }
         }
 
@@ -616,7 +652,7 @@ impl App {
                 #[cfg(feature = "gpu-decode")]
                 shared_gpu_handles,
             },
-        }));
+        }, self.event_proxy.clone()));
     }
 
     fn start_test_capture(&mut self, width: u32, height: u32, fps: u32, reason: &str) {
@@ -635,7 +671,7 @@ impl App {
                 alternate_formats,
                 force_format,
             },
-        }));
+        }, self.event_proxy.clone()));
     }
 
     fn start_audio(&mut self) {

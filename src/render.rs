@@ -318,7 +318,7 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniforms,
             0,
-            bytemuck::bytes_of(&VideoUniforms::for_format(format)),
+            bytemuck::bytes_of(&VideoUniforms::format_mode_for(format)),
         );
 
         upload_plane_r8(
@@ -378,18 +378,18 @@ impl Renderer {
     }
 
     /// Try to initialize shared DX12 ↔ CUDA buffers for zero-copy.
-    /// Returns shared handles for the CUDA side if successful.
+    /// Returns import handles for the CUDA side if successful.
+    /// The handles are ephemeral — CUDA imports them and they're closed on drop.
     #[cfg(feature = "gpu-decode")]
     pub fn try_init_shared_buffers(
         &mut self,
         width: u32,
         height: u32,
-    ) -> Option<Vec<crate::dx12_interop::SharedPlaneHandles>> {
-        let shared =
+    ) -> Option<crate::dx12_interop::ImportHandles> {
+        let (shared, import_handles) =
             crate::dx12_interop::SharedGpuBuffers::try_new(&self.device, width, height)?;
-        let handles: Vec<_> = shared.handles.to_vec();
         self.shared_gpu_buffers = Some(shared);
-        Some(handles)
+        Some(import_handles)
     }
 
     #[cfg(feature = "gpu-decode")]
@@ -399,7 +399,7 @@ impl Renderer {
             return;
         };
 
-        if buffer_index >= shared.buffer_sets.len() {
+        if buffer_index >= shared.0.len() {
             tracing::warn!("GPU frame buffer_index {buffer_index} out of range");
             return;
         }
@@ -433,10 +433,10 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniforms,
             0,
-            bytemuck::bytes_of(&VideoUniforms::for_format(format)),
+            bytemuck::bytes_of(&VideoUniforms::format_mode_for(format)),
         );
 
-        let buf_set = &shared.buffer_sets[buffer_index];
+        let buf_set = &shared.0[buffer_index];
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
         // GPU-side copy: shared buffer → Y texture
@@ -683,19 +683,18 @@ struct VideoUniforms {
     format_mode: u32,
     filter_mode: u32,
     viewport_size: [f32; 2],
-    _padding: [u32; 7],
+    // WGSL struct has _padding0: vec3<u32> (12 bytes) for 16-byte alignment.
+    // Total struct size = 28 bytes, but uniform buffers round up to 16-byte
+    // alignment so we pad to 32 bytes.
+    _padding: [u32; 4],
 }
 
 impl VideoUniforms {
-    fn for_format(format: PixelFormat) -> Self {
-        Self {
-            format_mode: match format {
-                PixelFormat::Nv12 => 0,
-                PixelFormat::Yuvj422p => 1,
-            },
-            filter_mode: 0,
-            viewport_size: [0.; 2],
-            _padding: [0; 7],
+    /// Returns just the format_mode value for a partial buffer write at offset 0.
+    fn format_mode_for(format: PixelFormat) -> u32 {
+        match format {
+            PixelFormat::Nv12 => 0,
+            PixelFormat::Yuvj422p => 1,
         }
     }
 }
@@ -1007,7 +1006,12 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Filter kernel math
+// ---------------------------------------------------------------------------
+
 fn cubic_weight(x: f32) -> f32 {
+    // Catmull-Rom (a = -0.5): good balance of sharpness and ringing
     let a = -0.5;
     let ax = abs(x);
     if ax <= 1.0 {
@@ -1029,6 +1033,10 @@ fn lanczos_weight(x: f32, a: f32) -> f32 {
     return sinc(x) * sinc(x / a);
 }
 
+// ---------------------------------------------------------------------------
+// Bicubic (4x4 taps, Catmull-Rom)
+// ---------------------------------------------------------------------------
+
 fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
@@ -1047,7 +1055,13 @@ fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     return sum / wsum;
 }
 
-fn sample_lanczos(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+// ---------------------------------------------------------------------------
+// Lanczos — 2-lobe (4x4 taps) for moderate upscale, 3-lobe (6x6 taps) for
+// large upscale ratios (>2x). The wider kernel eliminates aliasing/ringing
+// artifacts that the 2-lobe version produces at high magnification.
+// ---------------------------------------------------------------------------
+
+fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     let a = 2.0;
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
@@ -1066,14 +1080,61 @@ fn sample_lanczos(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     return sum / max(wsum, 1e-5);
 }
 
+fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    let a = 3.0;
+    let dims = vec2<f32>(textureDimensions(tex));
+    let texel = uv * dims - 0.5;
+    let base = floor(texel);
+    let frac = texel - base;
+    var sum = 0.0;
+    var wsum = 0.0;
+    for (var j = -2; j <= 3; j = j + 1) {
+        for (var i = -2; i <= 3; i = i + 1) {
+            let w = lanczos_weight(f32(i) - frac.x, a) * lanczos_weight(f32(j) - frac.y, a);
+            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
+            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
+            wsum = wsum + w;
+        }
+    }
+    return sum / max(wsum, 1e-5);
+}
+
+// ---------------------------------------------------------------------------
+// Filter dispatch — selects algorithm based on filter_mode uniform and
+// adapts kernel size based on viewport-to-source scale ratio.
+//
+// When the viewport is smaller than or equal to the source texture
+// (downscaling or 1:1), custom upscale filters are bypassed in favor of
+// hardware bilinear — upscale filters applied to minification would
+// undersample the source and produce aliasing.
+// ---------------------------------------------------------------------------
+
 fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    // Bypass custom filters when not upscaling (ratio <= 1.0).
+    // Hardware bilinear is correct for downscale/1:1 without mip chains.
+    let src_dims = vec2<f32>(textureDimensions(tex));
+    let scale = uniforms.viewport_size / max(src_dims, vec2<f32>(1.0));
+    let max_scale = max(scale.x, scale.y);
+
+    if max_scale <= 1.0 || uniforms.filter_mode == 0u {
+        // Bilinear: hardware-accelerated, or forced when downscaling
+        return textureSample(tex, tex_sampler, uv).r;
+    }
+
     if uniforms.filter_mode == 1u {
         return sample_bicubic(tex, uv);
-    } else if uniforms.filter_mode == 2u {
-        return sample_lanczos(tex, uv);
     }
-    return textureSample(tex, tex_sampler, uv).r; // bilinear, hardware path unchanged
+
+    // filter_mode == 2u: Lanczos with adaptive lobe count
+    if max_scale > 2.0 {
+        return sample_lanczos3(tex, uv);
+    }
+    return sample_lanczos2(tex, uv);
 }
+
+// ---------------------------------------------------------------------------
+// YUV → RGB color conversion
+// ---------------------------------------------------------------------------
 
 fn sample_yuvj422p(uv: vec2<f32>) -> vec3<f32> {
     let y = sample_plane(y_tex, uv);
