@@ -502,6 +502,8 @@ impl App {
             || old_settings.audio_input != self.settings.audio_input
             || old_settings.audio_output != self.settings.audio_output;
 
+        let scaling_changed = old_settings.scaling_filter != self.settings.scaling_filter;
+
         if video_changed {
             if let Some(capture) = &mut self.capture {
                 capture.stop();
@@ -514,6 +516,12 @@ impl App {
             self.start_audio();
         } else if (old_settings.volume - self.settings.volume).abs() > f64::EPSILON {
             self.audio.set_volume(self.settings.volume);
+        }
+
+        if scaling_changed {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_scale_filter(self.settings.scaling_filter);
+            }
         }
     }
 
@@ -531,6 +539,7 @@ impl App {
             height: self.latest_stats.map(|stats| stats.height),
             fps: self.latest_stats.map(|stats| stats.fps),
             show_overlay: self.settings.show_overlay && !self.is_minimized,
+            filter: self.settings.scaling_filter,
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
         }
