@@ -183,6 +183,7 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.selection.bg_fill = COLOR_ACCENT;
     style.visuals.selection.stroke = Stroke::new(1.0, COLOR_ACCENT);
     style.visuals.slider_trailing_fill = true;
+    style.wrap_mode = Some(egui::TextWrapMode::Extend);
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
     ctx.set_style(style);
