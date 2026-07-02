@@ -14,7 +14,6 @@ mod render;
 mod settings;
 mod ui;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,13 +25,14 @@ use settings::{get_capture_config, Settings};
 use tracing::{error, info, warn};
 use ui::{OverlayInfo, UiFrame, UiState};
 use windows::core::HSTRING;
+use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Icon, Window, WindowAttributes};
+use winit::window::{Window, WindowAttributes};
 
 const WINDOW_TITLE: &str = "TackleCast";
 const INITIAL_WIDTH: u32 = 1280;
@@ -133,9 +133,12 @@ struct App {
     latest_error: Option<String>,
     is_fullscreen: bool,
     is_minimized: bool,
+    is_sleep_suppressed: bool,
+    is_cursor_visible: bool,
     render_frame_counter: u64,
     render_frames_uploaded: u64,
     last_render_summary: Instant,
+    last_cursor_moved: Instant,
     #[cfg(feature = "gpu-decode")]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
@@ -165,24 +168,92 @@ impl App {
             latest_error: None,
             is_fullscreen: false,
             is_minimized: false,
+            is_sleep_suppressed: false,
+            is_cursor_visible: true,
             render_frame_counter: 0,
             render_frames_uploaded: 0,
             last_render_summary: Instant::now(),
+            last_cursor_moved: Instant::now(),
             #[cfg(feature = "gpu-decode")]
             gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
     }
 
     fn create_window(event_loop: &ActiveEventLoop) -> Window {
-        event_loop
+        let window = event_loop
             .create_window(
                 WindowAttributes::default()
                     .with_title(WINDOW_TITLE)
                     .with_resizable(true)
                     .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
-                    .with_window_icon(load_window_icon()),
             )
-            .expect("failed to create window")
+            .expect("failed to create window");
+
+        // Apply window icon from exe resources
+        unsafe {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                LoadImageW, SendMessageW, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+                ICON_BIG, ICON_SMALL, WM_SETICON,
+            };
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+            // 1. Fetch the HWND from winit's HasWindowHandle structure
+            let handle_abstract = window.window_handle().expect("Failed to read window handle");
+            if let RawWindowHandle::Win32(win32_handle) = handle_abstract.as_raw() {
+                let hwnd = HWND(win32_handle.hwnd.get() as *mut std::ffi::c_void);
+
+                // 2. Fetch current module instance handle
+                let h_instance = GetModuleHandleW(None).unwrap_or_default();
+
+                // 3. Map numeric ID 1 assigned by winresource into PCWSTR
+                let icon_name = PCWSTR(std::ptr::without_provenance(1));
+
+                // 4. Load the embedded icon layout
+                if let Ok(handle) = LoadImageW(
+                    h_instance,
+                    icon_name,
+                    IMAGE_ICON,
+                    0, // Allow OS to handle ideal bounds sampling
+                    0,
+                    LR_DEFAULTSIZE | LR_SHARED,
+                ) {
+                    let h_icon = HICON(handle.0);
+
+                    if !h_icon.is_invalid() {
+                        // 5. Send messages to assign to taskbar and titlebar context
+                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(h_icon.0 as isize));
+                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(h_icon.0 as isize));
+                    }
+                }
+            }
+        }
+
+        window
+    }
+
+    /// Sets ES_DISPLAY_REQUIRED to prevent the display from going to sleep.
+    fn set_display_sleep_suppression(&mut self, should_suppress: bool) {
+        if should_suppress != self.is_sleep_suppressed {
+            info!(should_suppress, "updating display sleep suppression");
+            self.is_sleep_suppressed = should_suppress;
+            let flags = if should_suppress { ES_CONTINUOUS | ES_DISPLAY_REQUIRED } else { ES_CONTINUOUS };
+            unsafe {
+                SetThreadExecutionState(flags);
+            }
+        }
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if visible != self.is_cursor_visible {
+            if let Some(window) = &self.window {
+                info!(self.is_cursor_visible, "updating cursor visibility");
+                self.is_cursor_visible = visible;
+                window.set_cursor_visible(visible);
+            }
+        }
     }
 }
 
@@ -243,6 +314,10 @@ impl ApplicationHandler for App {
                                 ui.open_menu(&self.settings);
                             }
                         }
+                        if self.ui.as_ref().is_some_and(|ui| ui.is_menu_open()) {
+                            self.set_cursor_visible(true);
+                        }
+
                         return;
                     }
                     Key::Named(NamedKey::F11) => {
@@ -269,6 +344,11 @@ impl ApplicationHandler for App {
                 }
                 event_loop.exit();
             }
+            WindowEvent::CursorMoved { .. } => {
+                self.last_cursor_moved = Instant::now();
+                self.set_cursor_visible(true);
+            }
+            WindowEvent::Focused(is_focused) => self.set_display_sleep_suppression(is_focused),
             WindowEvent::Resized(size) => {
                 self.is_minimized = size.width == 0 || size.height == 0;
                 if let Some(renderer) = &mut self.renderer {
@@ -277,12 +357,14 @@ impl ApplicationHandler for App {
                 if !self.is_minimized {
                     window.request_redraw();
                 }
+                self.set_display_sleep_suppression(!self.is_minimized);
             }
             WindowEvent::Occluded(occluded) => {
                 self.is_minimized = occluded;
                 if !self.is_minimized {
                     window.request_redraw();
                 }
+                self.set_display_sleep_suppression(!self.is_minimized);
             }
             WindowEvent::RedrawRequested => {
                 if self.is_minimized {
@@ -393,6 +475,12 @@ impl ApplicationHandler for App {
             self.render_frames_uploaded = 0;
             self.last_render_summary = Instant::now();
         }
+
+        // Hide cursor after 3s of inactivity if the ui menu is closed
+        let cursor_idle_elapsed = self.last_cursor_moved.elapsed();
+        if self.is_cursor_visible && cursor_idle_elapsed >= std::time::Duration::from_secs(3) && self.ui.as_ref().is_none_or(|ui| !ui.is_menu_open()) {
+            self.set_cursor_visible(false);
+        }
     }
 }
 
@@ -456,6 +544,7 @@ impl App {
             } else {
                 window.set_fullscreen(None);
             }
+            self.set_display_sleep_suppression(self.is_fullscreen);
         }
     }
 
@@ -563,16 +652,4 @@ impl App {
             self.settings.volume,
         );
     }
-}
-
-#[allow(dead_code)]
-fn project_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn load_window_icon() -> Option<Icon> {
-    let icon_path = project_root().join("assets").join("icon.ico");
-    let image = image::open(icon_path).ok()?.into_rgba8();
-    let (width, height) = image.dimensions();
-    Icon::from_rgba(image.into_raw(), width, height).ok()
 }

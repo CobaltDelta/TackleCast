@@ -153,9 +153,7 @@ impl SharedGpuBuffers {
             .ok()
             .expect("buffer_sets length mismatch");
         let handles: [SharedPlaneHandles; NUM_BUFFER_SETS] = handles_vec
-            .try_into()
-            .ok()
-            .expect("handles length mismatch");
+            .try_into().expect("handles length mismatch");
 
         info!("shared DX12 buffers created successfully for zero-copy pipeline");
         Some(Self {
@@ -259,7 +257,7 @@ fn create_shared_committed_buffer(
     // Create an NT shared handle for CUDA import.
     let handle = unsafe {
         device
-            .CreateSharedHandle(&resource, None, windows::Win32::Foundation::GENERIC_ALL.0 as u32, PCWSTR::null())
+            .CreateSharedHandle(&resource, None, windows::Win32::Foundation::GENERIC_ALL.0, PCWSTR::null())
             .map_err(|e| format!("CreateSharedHandle failed for {label}: {e}"))?
     };
 
