@@ -432,9 +432,17 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::FrameReady => {
-                // A new frame is available in the triple buffer — read it and
-                // request a redraw. This is the event-driven replacement for
-                // the old unconditional request_redraw() spin loop.
+                // Skip frame processing entirely when the window isn't visible.
+                // Without a render pass to drain them, queued write_texture calls
+                // accumulate in GPU memory indefinitely (display off, minimized, etc).
+                if self.is_minimized {
+                    // Still drain the triple buffer so it doesn't hold stale frames
+                    if let Some(capture) = &mut self.capture {
+                        let _ = capture.latest_frame();
+                    }
+                    return;
+                }
+
                 let mut uploaded = false;
                 if let Some(capture) = &mut self.capture {
                     if let Some(frame) = capture.latest_frame() {
@@ -449,10 +457,8 @@ impl ApplicationHandler<AppEvent> for App {
                     self.render_frames_uploaded += 1;
                 }
 
-                if !self.is_minimized {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             }
         }

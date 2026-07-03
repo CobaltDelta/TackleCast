@@ -529,9 +529,15 @@ impl Renderer {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
+                // Flush any staged write_texture/write_buffer calls so they
+                // don't accumulate when we can't present.
+                self.queue.submit(std::iter::empty());
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => {
+                self.queue.submit(std::iter::empty());
+                return Ok(());
+            }
             Err(wgpu::SurfaceError::OutOfMemory) => return Err(RenderError::OutOfMemory),
             Err(error) => return Err(RenderError::Surface(error)),
         };
